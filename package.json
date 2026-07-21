@@ -1,0 +1,46 @@
+{
+  "name": "zaltz",
+  "version": "0.1.1",
+  "description": "The whole synthesizer in one file of C \u2014 165 KB of wasm on the audio thread. A Strudel-compatible engine that does not glitch.",
+  "type": "module",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./worklet": "./dist/zaltz.worklet.js",
+    "./wasm": "./dist/zaltz.wasm"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "dist/",
+    "engine/",
+    "NOTICE.md"
+  ],
+  "scripts": {
+    "build": "cd engine && ./build.sh && cp zaltz.wasm ../dist/zaltz.wasm"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eliyahuleinkram/zaltz.git"
+  },
+  "homepage": "https://zaltz.klappn.com",
+  "bugs": "https://github.com/eliyahuleinkram/zaltz/issues",
+  "keywords": [
+    "audio",
+    "audioworklet",
+    "webassembly",
+    "wasm",
+    "synthesizer",
+    "strudel",
+    "tidalcycles",
+    "superdough",
+    "live-coding",
+    "music"
+  ],
+  "license": "AGPL-3.0-or-later",
+  "author": "Klappn (https://klappn.com)"
+}

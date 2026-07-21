@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- zaltz — the grain. One salt crystal, cut clean, lit from the top left,
+       a second grain thrown over the shoulder, one sparkle where the light
+       lands. One pink only. -->
+  <defs>
+    <linearGradient id="zt" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffc9e7"/>
+      <stop offset="1" stop-color="#ff63c1"/>
+    </linearGradient>
+    <linearGradient id="zl" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#e0319c"/>
+      <stop offset="1" stop-color="#b3126f"/>
+    </linearGradient>
+    <linearGradient id="zr" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#a60f66"/>
+      <stop offset="1" stop-color="#6e0a45"/>
+    </linearGradient>
+  </defs>
+  <!-- the grain over the shoulder -->
+  <g>
+    <polygon points="53,6 59.5,9.75 53,13.5 46.5,9.75" fill="url(#zt)"/>
+    <polygon points="46.5,9.75 53,13.5 53,21 46.5,17.25" fill="url(#zl)"/>
+    <polygon points="59.5,9.75 53,13.5 53,21 59.5,17.25" fill="url(#zr)"/>
+    <polyline points="46.5,9.75 53,6 59.5,9.75" fill="none" stroke="#fff" stroke-opacity=".3" stroke-width=".8" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <!-- the crystal -->
+  <g>
+    <polygon points="30,13 49.5,24.25 30,35.5 10.5,24.25" fill="url(#zt)"/>
+    <polygon points="10.5,24.25 30,35.5 30,58 10.5,46.75" fill="url(#zl)"/>
+    <polygon points="49.5,24.25 30,35.5 30,58 49.5,46.75" fill="url(#zr)"/>
+    <polyline points="10.5,24.25 30,13 49.5,24.25" fill="none" stroke="#fff" stroke-opacity=".32" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/>
+    <line x1="30" y1="35.5" x2="30" y2="58" stroke="#fff" stroke-opacity=".14" stroke-width="1"/>
+    <line x1="10.5" y1="24.25" x2="10.5" y2="46.75" stroke="#fff" stroke-opacity=".18" stroke-width=".9"/>
+  </g>
+  <!-- the sparkle — where the light lands on the crystal's lit corner -->
+  <path d="M22 15.5 Q23.1 19.4 27 20.5 Q23.1 21.6 22 25.5 Q20.9 21.6 17 20.5 Q20.9 19.4 22 15.5 Z" fill="#fff" fill-opacity=".92"/>
+  <path d="M40 28 Q40.55 29.95 42.5 30.5 Q40.55 31.05 40 33 Q39.45 31.05 37.5 30.5 Q39.45 29.95 40 28 Z" fill="#fff" fill-opacity=".55"/>
+</svg>
