@@ -1,7 +1,7 @@
 {
   "name": "zaltz",
-  "version": "0.1.2",
-  "description": "The whole synthesizer in one file of C \u2014 165 KB of wasm on the audio thread. A Strudel-compatible engine that does not glitch.",
+  "version": "0.1.3",
+  "description": "The whole synthesizer in one file of C — 165 KB of wasm on the audio thread. A Strudel-compatible engine that does not glitch.",
   "type": "module",
   "main": "index.js",
   "types": "index.d.ts",

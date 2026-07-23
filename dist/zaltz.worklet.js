@@ -24,6 +24,8 @@ class ZaltzProcessor extends AudioWorkletProcessor {
     this.ex = null;
     this.memU8 = null; // cached views — NOTHING allocates per event/quantum
     this.memF32 = null;
+    this.scrubbed = 0; // lifetime non-finite output samples zeroed
+    this.scrubReported = 0; // blocks stamp of the last scrub report
     this.port.onmessage = (e) => {
       try {
         this.handle(e.data);
@@ -188,16 +190,24 @@ class ZaltzProcessor extends AudioWorkletProcessor {
       const f = this.memF32;
       const o = this.ex.sd_out_ptr() >> 2;
       const L = out[0], R = out[1] ?? out[0];
-      // NaN SCRUB (v === v is false only for NaN): the master chain runs
-      // through DynamicsCompressorNodes, and a single NaN sample poisons a
-      // compressor's envelope PERMANENTLY (Chromium/WebKit) — the whole mix
+      // NON-FINITE SCRUB: the master chain runs through
+      // DynamicsCompressorNodes, and a single NaN OR Infinity sample poisons
+      // a compressor's envelope PERMANENTLY (Chromium/WebKit) — the whole mix
       // then stays silent until reload ("the set just turned off"). Whatever
       // ever goes wrong upstream, it must reach the graph as at worst a
-      // click, never as NaN.
+      // click, never as a non-finite sample. Scrubbed samples are counted and
+      // reported (rate-limited) so real engine corruption stays diagnosable
+      // instead of degrading to indistinguishable silence.
       for (let i = 0; i < L.length; i++) {
         const l = f[o + i * 2], r = f[o + i * 2 + 1];
-        L[i] = l === l ? l : 0;
-        R[i] = r === r ? r : 0;
+        if (Number.isFinite(l)) L[i] = l;
+        else { L[i] = 0; this.scrubbed++; }
+        if (Number.isFinite(r)) R[i] = r;
+        else { R[i] = 0; this.scrubbed++; }
+      }
+      if (this.scrubbed > 0 && this.blocks - this.scrubReported >= 375) {
+        this.scrubReported = this.blocks; // ~1s between reports
+        this.port.postMessage({ scrubbed: this.scrubbed });
       }
     }
     return this.active;

@@ -42,6 +42,11 @@ export class Zaltz {
       if (d?.error && this.onerror) this.onerror(String(d.error));
       else if (d?.clock != null && this.onclock) this.onclock(d.clock);
     };
+    // A wasm trap kills the processor with no port message — without this
+    // hook the engine dies silently and every later schedule() is a no-op.
+    node.onprocessorerror = () => {
+      if (this.onerror) this.onerror("zaltz: audio processor crashed — recreate the engine");
+    };
   }
 
   /**
@@ -119,10 +124,13 @@ export class Zaltz {
    */
   loadSample(id, pcm, { frames, channels = 1 } = {}) {
     const n = frames ?? Math.floor(pcm.length / channels);
+    // Ship exactly the allocated floats — an explicit `frames` smaller than
+    // the buffer must truncate the upload, never overrun the arena slot.
+    const total = Math.min(pcm.length, n * channels);
     this.node.port.postMessage({ sampleAlloc: id, frames: n, channels });
     const CHUNK = 65536;
-    for (let off = 0; off < pcm.length; off += CHUNK) {
-      const slice = pcm.slice(off, Math.min(off + CHUNK, pcm.length));
+    for (let off = 0; off < total; off += CHUNK) {
+      const slice = pcm.slice(off, Math.min(off + CHUNK, total));
       this.node.port.postMessage({ sampleChunk: id, offset: off, pcm: slice.buffer }, [slice.buffer]);
     }
   }

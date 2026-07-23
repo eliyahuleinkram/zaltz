@@ -1035,7 +1035,9 @@ static void start_voice(const Event *ev) {
     if (v->delay_send > 0) orbit_config_delay(&orbits[ob], ev->delaytime, ev->delayfeedback);
     v->shape_on = !is_nan(ev->shape) && ev->shape > 0;
     if (v->shape_on) {
-      float sh = ev->shape >= 1.0f ? 1.0f - 4e-10f : ev->shape; // ShapeProcessor clamp
+      // ShapeProcessor clamp — superdough's 1-4e-10 rounds to exactly 1.0f in
+      // float32 (k would be inf → NaN into the orbit rings); stop a hair lower.
+      float sh = ev->shape >= 0.999999f ? 0.999999f : ev->shape;
       v->shape_k = (2.0f * sh) / (1.0f - sh);
       float pg = ev->shapevol;
       v->shapevol = sd_fminf(sd_fmaxf(pg, 0.001f), 1.0f);
@@ -1082,9 +1084,11 @@ static void start_voice(const Event *ev) {
       v->pos = ev->speed < 0
                  ? (double)ev->endf * (double)sm->frames - 1.0 // reverse starts at the end
                  : (double)ev->begin * (double)sm->frames;
+      if (v->pos < 0) v->pos = 0; // negative begin must never index the arena
       v->end_frame = (double)ev->endf * (double)sm->frames;
       v->smp_loop = ev->loopv > 0;
       v->loop_a = (double)ev->loop_begin * (double)sm->frames;
+      if (v->loop_a < 0) v->loop_a = 0;
       v->loop_b = (double)ev->loop_end * (double)sm->frames;
     }
     if (ev->src == SRC_SUPERSAW) {
@@ -1246,8 +1250,8 @@ __attribute__((export_name("sd_dsp"))) void sd_dsp(void) {
       if (v->src == SRC_SAMPLE) {
         float xs = 0, xs_r = 0;
         bool in_range = v->rate < 0
-                          ? v->pos >= 0 && v->pos >= (double)0 && v->pos < (double)v->pcm_frames
-                          : v->pos < v->end_frame && v->pos < (double)v->pcm_frames;
+                          ? v->pos >= 0 && v->pos < (double)v->pcm_frames
+                          : v->pos >= 0 && v->pos < v->end_frame && v->pos < (double)v->pcm_frames;
         if (in_range) {
           int i0 = (int)v->pos;
           float fr = (float)(v->pos - (double)i0);
