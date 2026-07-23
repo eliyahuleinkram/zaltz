@@ -25,6 +25,7 @@ class ZaltzProcessor extends AudioWorkletProcessor {
     this.memU8 = null; // cached views — NOTHING allocates per event/quantum
     this.memF32 = null;
     this.scrubbed = 0; // lifetime non-finite output samples zeroed
+    this.scrubLast = 0; // scrubbed count at the last report — report only growth
     this.scrubReported = 0; // blocks stamp of the last scrub report
     this.port.onmessage = (e) => {
       try {
@@ -205,8 +206,9 @@ class ZaltzProcessor extends AudioWorkletProcessor {
         if (Number.isFinite(r)) R[i] = r;
         else { R[i] = 0; this.scrubbed++; }
       }
-      if (this.scrubbed > 0 && this.blocks - this.scrubReported >= 375) {
+      if (this.scrubbed > this.scrubLast && this.blocks - this.scrubReported >= 375) {
         this.scrubReported = this.blocks; // ~1s between reports
+        this.scrubLast = this.scrubbed; // quiet again until NEW scrubs land
         this.port.postMessage({ scrubbed: this.scrubbed });
       }
     }

@@ -37,9 +37,11 @@ export class Zaltz {
     this.node = node;
     this.onerror = null;
     this.onclock = null;
+    this.onscrub = null;
     node.port.onmessage = (e) => {
       const d = e.data;
       if (d?.error && this.onerror) this.onerror(String(d.error));
+      else if (d?.scrubbed != null && this.onscrub) this.onscrub(d.scrubbed);
       else if (d?.clock != null && this.onclock) this.onclock(d.clock);
     };
     // A wasm trap kills the processor with no port message — without this

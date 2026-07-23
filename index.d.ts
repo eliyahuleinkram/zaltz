@@ -63,6 +63,11 @@ export declare class Zaltz {
   /** Audio-thread clock ticks (~every 85 ms) — survives background-tab timer
    *  clamps; drive your scheduler's lookahead from this. */
   onclock: ((currentTime: number) => void) | null;
+  /** Non-finite output samples the engine zeroed before they could reach the
+   *  graph (lifetime count, reported at most ~1/s and only when it grows) —
+   *  at worst a click instead of a poisoned compressor, but a sign of real
+   *  upstream corruption worth reporting. */
+  onscrub: ((scrubbedSamples: number) => void) | null;
 
   static create(ctx: AudioContext, opts?: ZaltzCreateOptions): Promise<Zaltz>;
 
