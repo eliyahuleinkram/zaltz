@@ -176,15 +176,28 @@ class ZaltzProcessor extends AudioWorkletProcessor {
       this.syncViews(); // rebuilds only if the sample store grew
       this.drainCopies();
       this.ex.sd_dsp();
+      // sd_dsp itself can memory.grow (a new orbit's first delay line takes
+      // from the arena mid-render) — the view captured above is DETACHED then,
+      // and copying through it wrote one full quantum of NaN to the output:
+      // the audible click at a new song's first delay beat. Re-sync AFTER the
+      // render; it's one identity compare when nothing grew.
+      this.syncViews();
       // CACHED view — a fresh Float32Array per quantum (375/s) feeds the
       // worklet-thread GC, and its pauses are audible ticks. syncViews
       // rebuilds it only on an actual memory.grow.
       const f = this.memF32;
       const o = this.ex.sd_out_ptr() >> 2;
       const L = out[0], R = out[1] ?? out[0];
+      // NaN SCRUB (v === v is false only for NaN): the master chain runs
+      // through DynamicsCompressorNodes, and a single NaN sample poisons a
+      // compressor's envelope PERMANENTLY (Chromium/WebKit) — the whole mix
+      // then stays silent until reload ("the set just turned off"). Whatever
+      // ever goes wrong upstream, it must reach the graph as at worst a
+      // click, never as NaN.
       for (let i = 0; i < L.length; i++) {
-        L[i] = f[o + i * 2];
-        R[i] = f[o + i * 2 + 1];
+        const l = f[o + i * 2], r = f[o + i * 2 + 1];
+        L[i] = l === l ? l : 0;
+        R[i] = r === r ? r : 0;
       }
     }
     return this.active;
