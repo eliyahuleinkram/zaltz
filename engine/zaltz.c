@@ -698,6 +698,16 @@ static Event events[MAX_EVENTS];
 static float out_buf[BLOCK * OUT_CH];
 static char event_buf[EVENT_BUF];
 
+// ---------- STEM TAP (the take's track separation) ---------------------------
+// Armed by sd_stems: the bus pass mirrors each used orbit's post-FX,
+// post-duck, post-kill block — the EXACT per-sample value it adds into
+// out_buf — into that orbit's stem_buf slot. Summing every stem reconstructs
+// the pre-limiter master by construction; the host ships used slots to the
+// recorder. Off = one predictable branch per sample, no writes.
+static int stems_on = 0;
+static float stem_buf[MAX_ORBITS * BLOCK * OUT_CH];
+static unsigned int stem_mask_lo, stem_mask_hi; // orbits 0-31 / 32-39, per block
+
 // ---------- event string parsing ("key/value/key/value\0") -------------------
 static int str_eq(const char *a, const char *b) {
   while (*a && *b) { if (*a != *b) return 0; a++; b++; }
@@ -731,6 +741,11 @@ static float parse_f(const char *s) {
 
 __attribute__((export_name("sd_event_ptr"))) char *sd_event_ptr(void) { return event_buf; }
 __attribute__((export_name("sd_out_ptr"))) float *sd_out_ptr(void) { return out_buf; }
+__attribute__((export_name("sd_stems"))) void sd_stems(int on) { stems_on = on; }
+__attribute__((export_name("sd_stem_ptr"))) float *sd_stem_ptr(void) { return stem_buf; }
+// which orbits wrote their slot THIS block (a slot without its bit is stale)
+__attribute__((export_name("sd_stem_mask_lo"))) unsigned int sd_stem_mask_lo(void) { return stem_mask_lo; }
+__attribute__((export_name("sd_stem_mask_hi"))) unsigned int sd_stem_mask_hi(void) { return stem_mask_hi; }
 __attribute__((export_name("sd_time"))) double sd_time(void) { return engine_frame / (double)sr_f; }
 
 // sd_retire (declared above): live voices + already-queued events fade over
@@ -1193,6 +1208,8 @@ static inline float polyblep(double t, double dt) {
 
 __attribute__((export_name("sd_dsp"))) void sd_dsp(void) {
   for (int i = 0; i < BLOCK * OUT_CH; i++) out_buf[i] = 0;
+  stem_mask_lo = 0;
+  stem_mask_hi = 0;
 
   // start due events
   for (int i = 0; i < MAX_EVENTS; i++) {
@@ -1456,6 +1473,11 @@ __attribute__((export_name("sd_dsp"))) void sd_dsp(void) {
   for (int oi = 0; oi < MAX_ORBITS; oi++) {
     Orbit *o = &orbits[oi];
     if (!o->used) continue;
+    float *sb = stem_buf + oi * BLOCK * OUT_CH;
+    if (stems_on) {
+      if (oi < 32) stem_mask_lo |= 1u << oi;
+      else stem_mask_hi |= 1u << (oi - 32);
+    }
     if (o->verb_on) {
       // reverb retunes GLIDE (~50ms settle at 375 blocks/s) — the crackle
       // war's law extended to the FDN: buses ramp, never step (and NEVER
@@ -1550,8 +1572,14 @@ __attribute__((export_name("sd_dsp"))) void sd_dsp(void) {
       float g = orbit_duck_gain(o, engine_frame + i);
       o->out_g += (o->out_g_tgt - o->out_g) * 0.002f; // kill ramp (~10ms tau)
       g *= o->out_g;
-      out_buf[i * OUT_CH] += (o->dry[i * OUT_CH] + dl + wl) * g;
-      out_buf[i * OUT_CH + 1] += (o->dry[i * OUT_CH + 1] + dr + wr) * g;
+      float sl = (o->dry[i * OUT_CH] + dl + wl) * g;
+      float sr2 = (o->dry[i * OUT_CH + 1] + dr + wr) * g;
+      out_buf[i * OUT_CH] += sl;
+      out_buf[i * OUT_CH + 1] += sr2;
+      if (stems_on) {
+        sb[i * OUT_CH] = sl;
+        sb[i * OUT_CH + 1] = sr2;
+      }
       o->dry[i * OUT_CH] = 0;
       o->dry[i * OUT_CH + 1] = 0;
       o->vin[i] = 0;

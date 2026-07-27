@@ -77,6 +77,31 @@ Params speak superdough's language — `s`, `note`, ADSR, `lpf`, `room`,
 can learn to talk to zaltz in an afternoon. The pattern layer stays upstream;
 this package is the sound.
 
+## Live stems — track separation while you perform
+
+An offline render can't tape a performance; zaltz separates the *live* mix
+instead. Arm the stem tap and every orbit's post-FX stereo — delay, reverb,
+duck and kills included, exactly what that orbit pours into the master —
+streams back in ~85 ms batches, stamped with the context's own sample clock
+so stems align sample-exactly with each other and with anything else you
+record on that context. This is what
+[zaltz.klappn.com](https://zaltz.klappn.com)'s ● does: one take, a master
+plus a WAV per orbit, straight into a DAW.
+
+```js
+z.onstems = (b) => {
+  for (let k = 0; k < b.orbits.length; k++) {
+    // slice, not subarray — recycling transfers the batch buffer away
+    const pcm = b.stemBatch.slice(k * b.slotFloats, k * b.slotFloats + b.quanta * 256);
+    write(b.orbits[k], b.startFrame, pcm); // your recorder — interleaved stereo
+  }
+  z.recycleStemBatch(b.stemBatch); // zero steady-state allocation
+};
+z.stems(true);            // arm
+// … perform …
+z.stems(false, () => {}); // disarm — the tail flushes, then your callback
+```
+
 ## The laws
 
 Every rule in the engine was paid for with a click somebody heard:

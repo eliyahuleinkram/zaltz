@@ -38,11 +38,19 @@ export class Zaltz {
     this.onerror = null;
     this.onclock = null;
     this.onscrub = null;
+    this.onstems = null;
+    this._stemEnd = null;
     node.port.onmessage = (e) => {
       const d = e.data;
       if (d?.error && this.onerror) this.onerror(String(d.error));
       else if (d?.scrubbed != null && this.onscrub) this.onscrub(d.scrubbed);
       else if (d?.clock != null && this.onclock) this.onclock(d.clock);
+      else if (d?.stemBatch && this.onstems) this.onstems(d);
+      else if (d?.stemEnd && this._stemEnd) {
+        const done = this._stemEnd;
+        this._stemEnd = null;
+        done();
+      }
     };
     // A wasm trap kills the processor with no port message — without this
     // hook the engine dies silently and every later schedule() is a no-op.
@@ -116,6 +124,32 @@ export class Zaltz {
   /** Glided per-orbit output gain (0..2) — the "channel kill" primitive. */
   setOrbitGain(orbit, gain) {
     this.node.port.postMessage({ orbitGains: [{ o: orbit, g: gain }] });
+  }
+
+  /**
+   * THE STEM TAP — live track separation, taken at the engine's own mix
+   * point: while armed, every used orbit's post-FX stereo block (delay,
+   * reverb, duck and kill included — exactly what that orbit contributes to
+   * the master) streams back through `onstems` in ~85 ms batches. Each batch
+   * is { stemBatch, orbits, quanta, startFrame, slotFloats }: slot k holds
+   * orbit `orbits[k]`, interleaved stereo, at
+   * stemBatch[k*slotFloats … k*slotFloats + quanta*256). `startFrame` is the
+   * context's own sample clock, so batches align sample-exactly across
+   * orbits — and against anything else you capture on this context. Hand
+   * each batch's buffer back with recycleStemBatch() and the tap allocates
+   * nothing in steady state. Disarming flushes the tail, then `done` fires.
+   */
+  stems(on, done) {
+    if (on) this.node.port.postMessage({ stemsOn: true });
+    else {
+      this._stemEnd = done ?? null;
+      this.node.port.postMessage({ stemsOn: false });
+    }
+  }
+
+  /** Return a spent stem batch buffer to the worklet's pool (zero-alloc tap). */
+  recycleStemBatch(stemBatch) {
+    this.node.port.postMessage({ stemRecycle: stemBatch.buffer }, [stemBatch.buffer]);
   }
 
   /**

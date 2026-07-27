@@ -10,8 +10,17 @@
 //   { ev: "key/value/…", t: <ctx seconds> }   → schedule (time made engine-relative here)
 //   { hush: true }                            → sd_init re-init: voices/events cleared,
 //                                                sample arena KEPT (instant panic)
+//   { stemsOn: true|false }                   → arm/disarm the STEM TAP: while armed,
+//                                                every used orbit's post-FX block is
+//                                                batched (~85ms) and posted as
+//                                                { stemBatch, orbits, quanta,
+//                                                  startFrame, slotFloats } with the
+//                                                buffer TRANSFERRED; disarm flushes
+//                                                the tail then posts { stemEnd }
+//   { stemRecycle: ArrayBuffer }              → a spent batch buffer returned to the
+//                                                pool (zero steady-state allocation)
 //   "stop"                                    → processor retires
-/* global AudioWorkletProcessor, registerProcessor, sampleRate, currentTime */
+/* global AudioWorkletProcessor, registerProcessor, sampleRate, currentTime, currentFrame */
 
 // AudioWorkletGlobalScope has NO TextEncoder/TextDecoder — events are
 // pure-ASCII key/value strings written CHAR-BY-CHAR into wasm memory
@@ -100,6 +109,34 @@ class ZaltzProcessor extends AudioWorkletProcessor {
         for (const x of d.orbitGains) this.ex.sd_orbit_gain(x.o, x.g);
         return;
       }
+      if (d.stemsOn != null) {
+        if (d.stemsOn) {
+          this.ex.sd_stems(1);
+          // static buffer — its address survives memory.grow, cache once
+          this.stemBase = this.ex.sd_stem_ptr() >> 2;
+          this.cap = {
+            pool: [], // recycled batch buffers (main thread posts them back)
+            buf: null,
+            orbits: [],
+            slotOf: new Int8Array(40).fill(-1),
+            q: 0,
+            startFrame: 0,
+            expect: -1,
+            dropped: 0,
+          };
+        } else {
+          this.ex.sd_stems(0);
+          this.flushStems(); // the tail rides out first — port order is the contract
+          this.cap = null;
+          this.port.postMessage({ stemEnd: true });
+        }
+        return;
+      }
+      if (d.stemRecycle) {
+        if (this.cap && this.cap.pool.length < 4)
+          this.cap.pool.push(new Float32Array(d.stemRecycle));
+        return;
+      }
       if (d.evs) {
         // BATCHED: one message per bridge tick (Safari's worklet GC chokes on
         // per-hap message bursts — its pauses are the Safari-only ticks)
@@ -142,6 +179,85 @@ class ZaltzProcessor extends AudioWorkletProcessor {
     m[w] = 0;
     const rc = this.ex.sd_event();
     if (rc !== 0) this.port.postMessage({ eventError: rc });
+  }
+
+  // --- STEM TAP batching -----------------------------------------------------
+  // 32 quanta (~85ms) × 16 orbit slots × 256 interleaved floats = one pooled
+  // 512KB buffer per batch, TRANSFERRED out and posted back for reuse — the
+  // steady state allocates nothing on this thread (the GC law). Slots compact:
+  // an orbit joining mid-batch gets silence for the quanta it missed, one that
+  // hushes mid-batch writes silence, never stale garbage. `startFrame` stamps
+  // the batch on the context's own frame clock so the writer can align stems
+  // with the master tap (same clock) to the sample.
+  captureStems(frame) {
+    const cap = this.cap;
+    const ex = this.ex;
+    const lo = ex.sd_stem_mask_lo() | 0;
+    const hi = ex.sd_stem_mask_hi() | 0;
+    // engine skipped quanta (device sleep/wake): the batch is contiguous only
+    // up to here — ship it; the next one restarts at the new frame and the
+    // writer pads the hole with silence
+    if (cap.buf && cap.expect >= 0 && frame !== cap.expect) this.flushStems();
+    if (!cap.buf) {
+      if (!lo && !hi) {
+        cap.expect = -1; // nothing sounding — no batch; the gap pads itself
+        return;
+      }
+      cap.buf = cap.pool.pop() || new Float32Array(16 * 8192);
+      cap.orbits.length = 0;
+      cap.slotOf.fill(-1);
+      cap.q = 0;
+      cap.startFrame = frame;
+      cap.dropped = 0;
+    }
+    const f = this.memF32;
+    const base = this.stemBase;
+    const q = cap.q;
+    const buf = cap.buf;
+    for (let oi = 0; oi < 40; oi++) {
+      const on = oi < 32 ? (lo >>> oi) & 1 : (hi >>> (oi - 32)) & 1;
+      if (!on) continue;
+      let s = cap.slotOf[oi];
+      if (s < 0) {
+        if (cap.orbits.length >= 16) {
+          cap.dropped++; // >16 live orbits — beyond any IDE set; counted, reported
+          continue;
+        }
+        s = cap.orbits.length;
+        cap.slotOf[oi] = s;
+        cap.orbits.push(oi);
+        if (q) buf.fill(0, s * 8192, s * 8192 + q * 256); // born mid-batch
+      }
+      const src = base + oi * 256;
+      const dst = s * 8192 + q * 256;
+      for (let i = 0; i < 256; i++) buf[dst + i] = f[src + i];
+    }
+    for (let s = 0; s < cap.orbits.length; s++) {
+      const oi = cap.orbits[s];
+      const on = oi < 32 ? (lo >>> oi) & 1 : (hi >>> (oi - 32)) & 1;
+      if (!on) buf.fill(0, s * 8192 + q * 256, s * 8192 + (q + 1) * 256);
+    }
+    cap.q++;
+    cap.expect = frame + 128;
+    if (cap.q === 32) this.flushStems();
+  }
+
+  flushStems() {
+    const cap = this.cap;
+    if (!cap || !cap.buf) return;
+    const buf = cap.buf;
+    cap.buf = null;
+    this.port.postMessage(
+      {
+        stemBatch: buf,
+        orbits: cap.orbits.slice(),
+        quanta: cap.q,
+        startFrame: cap.startFrame,
+        slotFloats: 8192,
+        dropped: cap.dropped,
+      },
+      [buf.buffer],
+    );
   }
 
   drainCopies() {
@@ -206,6 +322,7 @@ class ZaltzProcessor extends AudioWorkletProcessor {
         if (Number.isFinite(r)) R[i] = r;
         else { R[i] = 0; this.scrubbed++; }
       }
+      if (this.cap) this.captureStems(currentFrame);
       if (this.scrubbed > this.scrubLast && this.blocks - this.scrubReported >= 375) {
         this.scrubReported = this.blocks; // ~1s between reports
         this.scrubLast = this.scrubbed; // quiet again until NEW scrubs land

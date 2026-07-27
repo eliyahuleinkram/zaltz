@@ -46,6 +46,21 @@ export type ZaltzParams = {
   [key: string]: string | number | undefined;
 };
 
+/** One ~85 ms batch from the stem tap (see Zaltz.stems). Slot k holds orbit
+ *  `orbits[k]` as interleaved stereo at
+ *  `stemBatch[k*slotFloats … k*slotFloats + quanta*256)`. */
+export interface ZaltzStemBatch {
+  stemBatch: Float32Array;
+  /** Engine orbit index per occupied slot, in slot order. */
+  orbits: number[];
+  /** 128-frame render quanta in this batch. */
+  quanta: number;
+  /** Context sample clock at the batch's first frame — sample-exact alignment. */
+  startFrame: number;
+  /** Stride between slots in `stemBatch` (floats). */
+  slotFloats: number;
+}
+
 export interface ZaltzCreateOptions {
   /** Override the worklet module URL (defaults to the packaged file). */
   workletUrl?: string | URL;
@@ -68,6 +83,8 @@ export declare class Zaltz {
    *  at worst a click instead of a poisoned compressor, but a sign of real
    *  upstream corruption worth reporting. */
   onscrub: ((scrubbedSamples: number) => void) | null;
+  /** Stem-tap batches while armed (see stems()) — one call per ~85 ms batch. */
+  onstems: ((batch: ZaltzStemBatch) => void) | null;
 
   static create(ctx: AudioContext, opts?: ZaltzCreateOptions): Promise<Zaltz>;
 
@@ -81,6 +98,11 @@ export declare class Zaltz {
   retire(seconds?: number): void;
   /** Glided per-orbit output gain (0..2) — the channel-kill primitive. */
   setOrbitGain(orbit: number, gain: number): void;
+  /** Arm/disarm the live stem tap: per-orbit post-FX audio streams through
+   *  `onstems` while armed. Disarm flushes the tail, then `done` fires. */
+  stems(on: boolean, done?: () => void): void;
+  /** Return a spent batch's buffer to the worklet's pool (zero-alloc tap). */
+  recycleStemBatch(stemBatch: Float32Array): void;
   /** Upload interleaved PCM under sample id `id`. */
   loadSample(
     id: number,
