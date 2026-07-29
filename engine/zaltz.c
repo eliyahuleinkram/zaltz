@@ -720,11 +720,21 @@ static inline float orbit_duck_env(Orbit *o, double f) {
   if (!o->duck_active) return 1.0f;
   if (f >= o->duck_t2) { o->duck_active = false; return 1.0f; }
   if (f < o->duck_t0) return o->duck_from;
-  if (f < o->duck_t1 || o->duck_t1 <= o->duck_t0) {
-    if (o->duck_t1 <= o->duck_t0) return o->duck_low;
+  // THE RECOVERY USED TO NEVER RUN (2026-07-29, measured). `duckonset`
+  // defaults to 0, so t1 == t0 — and the old guard read
+  // `f < t1 || t1 <= t0`, whose right half is then TRUE for every f. The
+  // function returned duck_low for the WHOLE window and snapped to 1 at t2:
+  // a 200ms gate at 1% instead of superdough's instant dip and exponential
+  // climb back. Everything sharing a ducked bus got chopped rather than
+  // pumped — the user's fiddle. Onset dip and attack recovery are now
+  // separate stretches, and a zero-length onset simply skips to the climb.
+  if (f < o->duck_t1) { // the dip itself (only when duckonset > 0)
     float u = (float)((f - o->duck_t0) / (o->duck_t1 - o->duck_t0));
     return o->duck_from * sd_exp2f(u * sd_log2f(o->duck_low / o->duck_from));
   }
+  if (o->duck_t2 <= o->duck_t1) return o->duck_low; // degenerate attack
+  // the climb back: duck_low → 1 across `duckattack`, exponential like
+  // superdough's exponentialRampToValueAtTime
   float u = (float)((f - o->duck_t1) / (o->duck_t2 - o->duck_t1));
   return o->duck_low * sd_exp2f(u * sd_log2f(1.0f / o->duck_low));
 }
