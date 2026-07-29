@@ -37,11 +37,14 @@ render doesn't live where phones are slow.
 
 ## What's in the box
 
-- [`engine/zaltz.c`](engine/zaltz.c) — ~1,600 lines. Band-limited wavetable
+- [`engine/zaltz.c`](engine/zaltz.c) — ~2,400 lines. Band-limited wavetable
   oscillators (triangle at sample-exact 90° phase — a phase-blind test suite
   hid that bug once, never again), four noise colors, ADSR + filter envelopes,
   ladder/12dB/24dB filters, a growable sample store, looping soundfont voices,
-  and per-orbit buses: FDN reverb, delay, sidechain duck, phaser, waveshaping.
+  the full distortion family (scurve, soft, hard, cubic, diode, asym, fold,
+  sinefold, chebyshev), tremolo, pitch envelopes, a phase vocoder for
+  `stretch`, and per-orbit buses: FDN reverb, delay, sidechain duck, phaser,
+  waveshaping.
 - [`dist/zaltz.worklet.js`](dist/zaltz.worklet.js) — the AudioWorklet host.
   Events are written straight into engine memory (zero allocation per event on
   the audio thread — worklet GC pauses are audible, so there are none), sample
