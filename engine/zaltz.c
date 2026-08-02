@@ -1,5 +1,9 @@
 // ZALTZ — Klappn's own synthesis engine. C99, freestanding, wasm32.
 //
+// Copyright (C) 2026 Eliyahu Moshe Leinkram
+// Licensed under the GNU Affero General Public License, version 3 or later.
+// See LICENSE and NOTICE.md.
+//
 // FAITHFULNESS CONTRACT: this engine implements SUPERDOUGH's semantics — the
 // engine every Klappn song was written against — not a new sound. Every
 // formula is ported from superdough's JS (file:line noted inline). dough

@@ -131,6 +131,8 @@ ceremony.
 
 ## License
 
+Copyright (C) 2026 Eliyahu Moshe Leinkram.
+
 AGPL-3.0-or-later — zaltz is a derivative of superdough (the
 [Strudel](https://strudel.cc) project), and it honors its ancestor's terms;
 see [NOTICE.md](NOTICE.md).

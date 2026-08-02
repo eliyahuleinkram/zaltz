@@ -5,7 +5,8 @@
  * schedulers live a layer above (see https://github.com/eliyahuleinkram/klappn
  * for the reference integration — Klappn's Strudel bridge).
  *
- * The engine is a superdough derivative (AGPL-3.0-or-later) — see NOTICE.md.
+ * Copyright (C) 2026 Eliyahu Moshe Leinkram. The engine is a superdough
+ * derivative (AGPL-3.0-or-later) — see NOTICE.md.
  */
 
 /** Serialize a finite number without scientific notation (the engine's parser

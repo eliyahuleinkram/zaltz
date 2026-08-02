@@ -1,4 +1,6 @@
 // ZALTZ's AudioWorklet host — the audio-thread half of the engine.
+//
+// Copyright (C) 2026 Eliyahu Moshe Leinkram. AGPL-3.0-or-later — see NOTICE.md.
 // The wasm lives ENTIRELY in here (worklet-owned memory, exported by the
 // module): no SharedArrayBuffer, no COOP/COEP, every AudioWorklet browser.
 // Main-thread jank can only delay message ARRIVAL (absorbed by the bridge's
