@@ -2,7 +2,7 @@
 
 # zaltz
 
-**The whole synthesizer is one file of C. It compiles to 165 KB of wasm, lives
+**The whole synthesizer is one file of C. It compiles to 270 KB of wasm, lives
 on the audio thread, and does not glitch. Ever.**
 
 Browser audio engines synthesize on the main thread, and the main thread has
@@ -30,6 +30,12 @@ brightness, per feature, against superdough's own offline render. Then an
 8-song, 70-loop corpus of real music was A/B'd by ear before it became the
 default.
 
+It is held to the browser, not to itself. Filters are solved and run in
+double precision, so a high-pass at 40 Hz passes its cutoff at exactly unity,
+as Chrome's does; every control is checked against superdough's source or an
+analytic reference, from the flat in `bf3` to the tempo a bare `.delay()`
+echoes at.
+
 The day it shipped, Klappn deleted its entire mobile apology layer: the
 AI-generated "lite" rewrites of every song for phones, the reverb caps, the
 per-device mixes. Phones now play the same full mix as desktops, because the
@@ -37,14 +43,16 @@ render doesn't live where phones are slow.
 
 ## What's in the box
 
-- [`engine/zaltz.c`](engine/zaltz.c) — ~2,400 lines. Band-limited wavetable
-  oscillators (triangle at sample-exact 90° phase — a phase-blind test suite
-  hid that bug once, never again), four noise colors, ADSR + filter envelopes,
-  ladder/12dB/24dB filters, a growable sample store, looping soundfont voices,
-  the full distortion family (scurve, soft, hard, cubic, diode, asym, fold,
-  sinefold, chebyshev), tremolo, pitch envelopes, a phase vocoder for
-  `stretch`, and per-orbit buses: FDN reverb, delay, sidechain duck, phaser,
-  waveshaping.
+- [`engine/zaltz.c`](engine/zaltz.c) — ~3,000 lines. Band-limited
+  oscillators at Chrome's own levels, a pulse oscillator with pulse-width
+  sweep, FM, supersaw, four noise colors and a noise mix, harmonic-count
+  waveforms; low-pass, high-pass and band-pass filters (biquad, ladder or
+  24 dB) each with its own envelope, plus vowel formants and a DJ filter; a
+  growable sample store with slicing, reverse, loops, cut groups and nudge,
+  looping soundfont voices, the full distortion family (scurve, soft, hard,
+  cubic, diode, asym, fold, sinefold, chebyshev), tremolo in five shapes,
+  pitch envelopes, a phase vocoder for `stretch`, and per-orbit buses: FDN
+  reverb, delay, sidechain duck, phaser, waveshaping.
 - [`dist/zaltz.worklet.js`](dist/zaltz.worklet.js) — the AudioWorklet host.
   Events are written straight into engine memory (zero allocation per event on
   the audio thread — worklet GC pauses are audible, so there are none), sample
@@ -75,9 +83,9 @@ z.scheduleAll(bass.flatMap((note, beat) => [
 ]));
 ```
 
-Params speak superdough's language — `s`, `note`, ADSR, `lpf`, `room`,
-`delay`, `shape`, `orbit`, `duck` — so anything that already talks to Strudel
-can learn to talk to zaltz in an afternoon. The pattern layer stays upstream;
+Params speak superdough's language — `s`, `note: "bf3"`, ADSR, `lpf`, `bpf`,
+`vowel: "a"`, `fm`, `room`, `delay`, `shape`, `orbit`, `duck` — so anything
+that already talks to Strudel can learn to talk to zaltz in an afternoon. The pattern layer stays upstream;
 this package is the sound.
 
 ## Live stems — track separation while you perform

@@ -52,12 +52,32 @@ static float sd_sinf(float x) {
   float k = (float)(int)(x * 0.31830988618f + (x >= 0 ? 0.5f : -0.5f)); // round(x/π)
   float y = x - k * PI_F;
   float y2 = y * y;
-  // Taylor deg-7 on [−π/2, π/2]: max err ~1.6e-5 (−96 dB)
-  float r = y * (1.0f + y2 * (-0.166666667f + y2 * (0.008333333f + y2 * -0.000198413f)));
+  // Taylor deg-11 on [−π/2, π/2]: max err ~6e-8 — float precision. (It was
+  // deg-7, ~1e-4 at the quadrant edge, which is exactly where sd_cosf lands.)
+  float r = y * (1.0f + y2 * (-0.16666666667f + y2 * (0.0083333333333f + y2 * (-0.00019841269841f +
+                y2 * (2.7557319224e-6f + y2 * -2.5052108385e-8f)))));
   // odd k flips the sign
   return ((int)k & 1) ? -r : r;
 }
 static float sd_cosf(float x) { return sd_sinf(x + 1.57079632679f); }
+
+// DOUBLE sin/cos for FILTER COEFFICIENTS (2026-09-23). A biquad's low end
+// lives in 1 − cos(w0), which at 40Hz/48k is 1.4e-5 — smaller than the float
+// sine's old error. Every filter under ~400Hz was mistuned: hpf(100) passed
+// its own cutoff at −6dB (Web Audio: 0dB), lpf(150) rang +2.9dB. Browsers
+// compute biquads in double (Chromium's Biquad: double coefficients + state);
+// so do we. Taylor deg-17 on [−π/2, π/2] after exact-ish reduction: ~1e-14.
+static double sd_sin_d(double x) {
+  const double PI_D = 3.14159265358979323846;
+  double k = (double)(long long)(x * (1.0 / PI_D) + (x >= 0 ? 0.5 : -0.5));
+  double y = x - k * PI_D;
+  double y2 = y * y;
+  double r = y * (1.0 + y2 * (-1.0 / 6 + y2 * (1.0 / 120 + y2 * (-1.0 / 5040 + y2 * (1.0 / 362880 +
+             y2 * (-1.0 / 39916800 + y2 * (1.0 / 6227020800.0 + y2 * (-1.0 / 1307674368000.0 +
+             y2 * (1.0 / 355687428096000.0)))))))));
+  return ((long long)k & 1) ? -r : r;
+}
+static double sd_cos_d(double x) { return sd_sin_d(x + 1.57079632679489661923); }
 
 // exp2: split int/frac, 5th-order poly on [0,1) (coefficient-time only).
 static float sd_exp2f(float x) {
@@ -65,7 +85,10 @@ static float sd_exp2f(float x) {
   int ip = (int)x;
   if (x < 0 && x != (float)ip) ip -= 1;
   float fr = x - (float)ip;
-  float p = 1.0f + fr * (0.69314718f + fr * (0.24022651f + fr * (0.05550411f + fr * (0.00961813f + fr * 0.00133336f))));
+  // Taylor to fr^7 (was fr^5: 0.15 cents sharp-to-flat across every octave
+  // — inaudible, but a systematic tuning error has no place in the engine)
+  float p = 1.0f + fr * (0.69314718f + fr * (0.24022651f + fr * (0.05550411f + fr * (0.00961813f +
+            fr * (0.00133336f + fr * (1.5403530e-4f + fr * 1.5252734e-5f))))));
   union { uint32_t u; float f; } sc;
   sc.u = (uint32_t)(ip + 127) << 23;
   return p * sc.f;
@@ -77,10 +100,11 @@ static float sd_log2f(float x) {
   int e = (int)((g.u >> 23) & 0xFF) - 127;
   g.u = (g.u & 0x007FFFFFu) | 0x3F800000u; // mantissa in [1,2)
   float m = g.f;
-  // poly for log2(m) on [1,2), err ~2e-4 (control-rate only)
-  float t = m - 1.0f;
-  float l = t * (1.442695f + t * (-0.7213475f + t * (0.4809f + t * -0.2987f)));
-  return (float)e + l;
+  // ln m = 2·atanh(s), s = (m−1)/(m+1) ∈ [0, 1/3]: odd series to s^9,
+  // err ~1e-6 (was a quartic, ~2e-4 — it shaped every exponential ramp)
+  float sv = (m - 1.0f) / (m + 1.0f), s2 = sv * sv;
+  float ln = 2.0f * sv * (1.0f + s2 * (1.0f / 3 + s2 * (1.0f / 5 + s2 * (1.0f / 7 + s2 * (1.0f / 9)))));
+  return (float)e + ln * 1.44269504089f;
 }
 
 static float sd_fabsf(float x) { return x < 0 ? -x : x; }
@@ -170,68 +194,63 @@ static float adsr_at(const Adsr *e, float tt, float dur) {
 // ---------- biquad — WebAudio BiquadFilterNode lowpass semantics -------------
 // Spec: lowpass resonance Q is in dB → linear q = 10^(Q/20); RBJ cookbook.
 typedef struct {
-  float b0, b1, b2, a1, a2;
-  float x1, x2, y1, y2;
+  double b0, b1, b2, a1, a2; // DOUBLE, like Chromium's Biquad — poles near 1
+  double x1, x2, y1, y2;     // at low cutoffs need the precision
   bool active;
 } Biquad;
 
 static void biquad_lowpass(Biquad *f, float freq, float qdb, float sr) {
-  float w0 = TWO_PI * sd_fminf(sd_fmaxf(freq, 10.0f), sr * 0.49f) / sr;
-  float q = sd_fmaxf(sd_pow10f(qdb / 20.0f), 0.0001f);
-  float alpha = sd_sinf(w0) / (2.0f * q);
-  float cosw = sd_cosf(w0);
-  float a0 = 1.0f + alpha;
-  f->b0 = ((1.0f - cosw) / 2.0f) / a0;
-  f->b1 = (1.0f - cosw) / a0;
+  double w0 = 6.283185307179586 * (double)sd_fminf(sd_fmaxf(freq, 10.0f), sr * 0.49f) / (double)sr;
+  double q = (double)sd_fmaxf(sd_pow10f(qdb / 20.0f), 0.0001f);
+  double alpha = sd_sin_d(w0) / (2.0 * q);
+  double cosw = sd_cos_d(w0);
+  double a0 = 1.0 + alpha;
+  f->b0 = ((1.0 - cosw) / 2.0) / a0;
+  f->b1 = (1.0 - cosw) / a0;
   f->b2 = f->b0;
-  f->a1 = (-2.0f * cosw) / a0;
-  f->a2 = (1.0f - alpha) / a0;
+  f->a1 = (-2.0 * cosw) / a0;
+  f->a2 = (1.0 - alpha) / a0;
   f->x1 = f->x2 = f->y1 = f->y2 = 0;
   f->active = true;
 }
 // notch — WebAudio Q is LINEAR here (only lp/hp speak dB); RBJ cookbook
 static void biquad_notch(Biquad *f, float freq, float q, float sr) {
-  float w0 = TWO_PI * sd_fminf(sd_fmaxf(freq, 10.0f), sr * 0.49f) / sr;
+  double w0 = 6.283185307179586 * (double)sd_fminf(sd_fmaxf(freq, 10.0f), sr * 0.49f) / (double)sr;
   if (q < 0.0001f) q = 0.0001f;
-  float alpha = sd_sinf(w0) / (2.0f * q);
-  float cosw = sd_cosf(w0);
-  float a0 = 1.0f + alpha;
-  float x1 = f->x1, x2 = f->x2, y1 = f->y1, y2 = f->y2; // retune keeps state
-  f->b0 = 1.0f / a0;
-  f->b1 = (-2.0f * cosw) / a0;
-  f->b2 = 1.0f / a0;
-  f->a1 = (-2.0f * cosw) / a0;
-  f->a2 = (1.0f - alpha) / a0;
+  double alpha = sd_sin_d(w0) / (2.0 * (double)q);
+  double cosw = sd_cos_d(w0);
+  double a0 = 1.0 + alpha;
+  double x1 = f->x1, x2 = f->x2, y1 = f->y1, y2 = f->y2; // retune keeps state
+  f->b0 = 1.0 / a0;
+  f->b1 = (-2.0 * cosw) / a0;
+  f->b2 = 1.0 / a0;
+  f->a1 = (-2.0 * cosw) / a0;
+  f->a2 = (1.0 - alpha) / a0;
   f->x1 = x1; f->x2 = x2; f->y1 = y1; f->y2 = y2;
   f->active = true;
 }
 
 static void biquad_highpass(Biquad *f, float freq, float qdb, float sr) {
-  float w0 = TWO_PI * sd_fminf(sd_fmaxf(freq, 10.0f), sr * 0.49f) / sr;
-  float q = sd_fmaxf(sd_pow10f(qdb / 20.0f), 0.0001f);
-  float alpha = sd_sinf(w0) / (2.0f * q);
-  float cosw = sd_cosf(w0);
-  float a0 = 1.0f + alpha;
-  f->b0 = ((1.0f + cosw) / 2.0f) / a0;
-  f->b1 = (-(1.0f + cosw)) / a0;
+  double w0 = 6.283185307179586 * (double)sd_fminf(sd_fmaxf(freq, 10.0f), sr * 0.49f) / (double)sr;
+  double q = (double)sd_fmaxf(sd_pow10f(qdb / 20.0f), 0.0001f);
+  double alpha = sd_sin_d(w0) / (2.0 * q);
+  double cosw = sd_cos_d(w0);
+  double a0 = 1.0 + alpha;
+  f->b0 = ((1.0 + cosw) / 2.0) / a0;
+  f->b1 = (-(1.0 + cosw)) / a0;
   f->b2 = f->b0;
-  f->a1 = (-2.0f * cosw) / a0;
-  f->a2 = (1.0f - alpha) / a0;
+  f->a1 = (-2.0 * cosw) / a0;
+  f->a2 = (1.0 - alpha) / a0;
   f->x1 = f->x2 = f->y1 = f->y2 = 0;
   f->active = true;
 }
-static void biquad_lowpass_coeffs(Biquad *f, float freq, float qdb, float sr) {
-  float x1 = f->x1, x2 = f->x2, y1 = f->y1, y2 = f->y2;
-  bool act = f->active;
-  biquad_lowpass(f, freq, qdb, sr);
-  f->x1 = x1; f->x2 = x2; f->y1 = y1; f->y2 = y2;
-  f->active = act || true;
-}
-static inline float biquad_run(Biquad *f, float x) {
-  float y = f->b0 * x + f->b1 * f->x1 + f->b2 * f->x2 - f->a1 * f->y1 - f->a2 * f->y2;
+static inline float biquad_run(Biquad *f, float xin) {
+  double x = (double)xin;
+  double y = f->b0 * x + f->b1 * f->x1 + f->b2 * f->x2 - f->a1 * f->y1 - f->a2 * f->y2;
+  if (y < 1e-30 && y > -1e-30) y = 0; // denormal flush (the crackle-killer law)
   f->x2 = f->x1; f->x1 = x;
   f->y2 = f->y1; f->y1 = y;
-  return y;
+  return (float)y;
 }
 
 // NOISE prng — xorshift32; superdough noise is Math.random (noise.mjs), so
@@ -267,34 +286,201 @@ static inline float ladder_cut(float freq, float sr) {
   return c > 1.0f ? 1.0f : c;
 }
 
-// getParamADSR 'exponential' shape on [vmin..vmax] evaluated analytically —
-// exponentialRamp interpolation v1·(v2/v1)^u between the same schedule points
-// as the linear amp env. vmin/vmax floored at 0.001 (helpers.mjs:60).
+// getParamADSR 'exponential' (helpers.mjs:40-99), evaluated analytically. The
+// SCHEDULE is superdough's, not an ideal curve: the ramp TARGETS come from a
+// LINEAR interpolation (envValAtTime), and each segment glides to its target
+// exponentially (v1·(v2/v1)^u). That difference is audible exactly where it
+// matters — a note shorter than attack+decay (a pluck, a hat with a filter
+// env): superdough ramps to the linearly-interpolated value at the note's
+// end, an ideal exponential curve would sit far lower. min/max of exactly 0
+// become 0.001 (the curve can't touch zero).
+static inline float exp_ramp(float v1, float v2, float u) {
+  if (u <= 0) return v1;
+  if (u >= 1) return v2;
+  if (v1 <= 0 || v2 <= 0) return v1; // spec: no exponential ramp through 0 — hold
+  return v1 * sd_exp2f(u * sd_log2f(v2 / v1));
+}
 static float adsr_exp_at(const Adsr *e, float tt, float dur, float vmin, float vmax) {
-  if (vmin < 0.001f) vmin = 0.001f;
-  if (vmax < 0.001f) vmax = 0.001f;
+  if (vmin == 0) vmin = 0.001f;
+  if (vmax == 0) vmax = 0.001f;
+  const float a = e->attack, d = e->decay;
   const float susv = vmin + e->sustain * (vmax - vmin);
-  float from, to, u;
+  // envValAtTime: the linear shape, used only as ramp TARGETS
+  #define ENV_LIN(T) ({ float _t = (T); float _v = (a > _t) ? _t * ((vmax - vmin) / a) + vmin \
+                                                        : (_t - a) * ((susv - vmax) / d) + vmax; \
+                        _v == 0 ? 0.001f : _v; })
   if (tt < 0) return vmin;
-  if (tt >= dur) {
-    float held;
-    if (dur < e->attack) held = vmin * sd_exp2f((dur / e->attack) * sd_log2f(vmax / vmin));
-    else if (dur < e->attack + e->decay)
-      held = vmax * sd_exp2f(((dur - e->attack) / e->decay) * sd_log2f(sd_fmaxf(susv, 0.001f) / vmax));
-    else held = sd_fmaxf(susv, 0.001f);
-    float rt = (tt - dur) / e->release;
-    if (rt >= 1.0f) return vmin;
-    return held * sd_exp2f(rt * sd_log2f(vmin / held));
+  float held; // the value the schedule reaches at `dur`
+  if (a > dur) { // attack only, cut at the end
+    held = ENV_LIN(dur);
+    if (tt < dur) return exp_ramp(vmin, held, tt / dur);
+  } else if (a + d > dur) { // attack, then a decay cut at the end
+    float top = ENV_LIN(a);
+    held = ENV_LIN(dur);
+    if (tt < a) return exp_ramp(vmin, top, tt / a);
+    if (tt < dur) return exp_ramp(top, held, (tt - a) / (dur - a));
+  } else { // attack, decay, hold at sustain
+    float top = ENV_LIN(a);
+    float sv = ENV_LIN(a + d);
+    held = susv;
+    if (tt < a) return exp_ramp(vmin, top, tt / a);
+    if (tt < a + d) return exp_ramp(top, sv, (tt - a) / d);
+    if (tt < dur) return susv;
   }
-  if (tt < e->attack) { from = vmin; to = vmax; u = tt / e->attack; }
-  else if (tt < e->attack + e->decay) { from = vmax; to = sd_fmaxf(susv, 0.001f); u = (tt - e->attack) / e->decay; }
-  else return sd_fmaxf(susv, 0.001f);
-  return from * sd_exp2f(u * sd_log2f(to / from));
+  #undef ENV_LIN
+  return exp_ramp(held, vmin, (tt - dur) / e->release); // release → min
+}
+
+// ---------- THE FILTER FAMILY (superdough createFilter, helpers.mjs:219) -----
+// lpf, hpf and bpf are ONE mechanism upstream: a biquad (Q in dB for lp/hp,
+// LINEAR for bp — Web Audio), or under ftype "ladder" the LadderProcessor —
+// which is a LOWPASS topology whatever the type (the corpus was authored with
+// that quirk); ftype 24db cascades a second identical stage; each has the
+// same exponential envelope with the shared fanchor. Order: lp → hp → bp.
+enum { FT_LP = 0, FT_HP, FT_BP };
+typedef struct {
+  bool on;
+  int type;
+  bool ladder, x24;
+  float q;
+  Biquad f[2][2]; // [stage][channel]
+  Ladder lad[2];  // [channel]
+  float lad_cut, lad_k, lad_drive, lad_makeup;
+  bool env_on;
+  Adsr env;
+  float fmin, fmax;
+} Filt;
+
+static void biquad_bandpass(Biquad *f, float freq, float q, float sr) {
+  // Web Audio bandpass (constant 0dB peak): alpha = sin(w0)/(2Q), Q LINEAR
+  double w0 = 6.283185307179586 * (double)sd_fminf(sd_fmaxf(freq, 10.0f), sr * 0.49f) / (double)sr;
+  if (q < 0.0001f) q = 0.0001f;
+  double alpha = sd_sin_d(w0) / (2.0 * (double)q);
+  double cosw = sd_cos_d(w0);
+  double a0 = 1.0 + alpha;
+  f->b0 = alpha / a0;
+  f->b1 = 0;
+  f->b2 = -alpha / a0;
+  f->a1 = (-2.0 * cosw) / a0;
+  f->a2 = (1.0 - alpha) / a0;
+  f->x1 = f->x2 = f->y1 = f->y2 = 0;
+  f->active = true;
+}
+// set a biquad by type; keep = retune under a sounding signal (state kept)
+static void biquad_set(Biquad *f, int type, float freq, float q, float sr, bool keep) {
+  double x1 = f->x1, x2 = f->x2, y1 = f->y1, y2 = f->y2;
+  if (type == FT_HP) biquad_highpass(f, freq, q, sr);
+  else if (type == FT_BP) biquad_bandpass(f, freq, q, sr);
+  else biquad_lowpass(f, freq, q, sr);
+  if (keep) { f->x1 = x1; f->x2 = x2; f->y1 = y1; f->y2 = y2; }
+}
+static void filt_setup(Filt *F, int type, float freq, float q, int ftype, float drive,
+                       float a, float d, float s, float r, float envv, float anchor, float sr) {
+  F->on = !is_nan(freq) && freq > 0;
+  if (!F->on) return;
+  F->type = type;
+  F->q = q;
+  F->ladder = ftype == 1;
+  F->x24 = ftype == 2;
+  if (F->ladder) {
+    F->lad[0] = (Ladder){0}; F->lad[1] = (Ladder){0};
+    F->lad_cut = ladder_cut(freq, sr);
+    F->lad_k = sd_fminf(8.0f, q * 0.13f); // worklets.mjs:404
+    float dr = sd_exp2f(drive * 1.44269504089f); // exp(drive), clamped .1–2000
+    F->lad_drive = dr < 0.1f ? 0.1f : dr > 2000.0f ? 2000.0f : dr;
+    F->lad_makeup = (1.0f / F->lad_drive) * sd_fminf(1.75f, 1.0f + F->lad_k);
+  } else {
+    biquad_set(&F->f[0][0], type, freq, q, sr, false);
+    F->f[0][1] = F->f[0][0];
+    F->f[1][0] = F->f[0][0];
+    F->f[1][1] = F->f[0][0];
+  }
+  // the envelope is live when ANY of its five params was given
+  F->env_on = !is_nan(a) || !is_nan(d) || !is_nan(s) || !is_nan(r) || !is_nan(envv);
+  if (F->env_on) {
+    F->env = adsr_values(a, d, s, r, 0.005f, 0.14f, 0.0f, 0.1f);
+    float e = is_nan(envv) ? 1.0f : envv;      // nanFallback(env, 1)
+    float an = is_nan(anchor) ? 0.0f : anchor; // nanFallback(anchor, 0)
+    float ea = sd_fabsf(e), off = ea * an;
+    float mn = sd_clampf(sd_exp2f(-off) * freq, 0.0f, 20000.0f);
+    float mx = sd_clampf(sd_exp2f(ea - off) * freq, 0.0f, 20000.0f);
+    if (e < 0) { float t = mn; mn = mx; mx = t; }
+    F->fmin = mn;
+    F->fmax = mx;
+  }
+}
+static void filt_env(Filt *F, float tt, float dur, float sr) {
+  if (!F->on || !F->env_on) return;
+  float fq = adsr_exp_at(&F->env, tt, dur, F->fmin, F->fmax);
+  if (F->ladder) { F->lad_cut = ladder_cut(fq, sr); return; }
+  // ONE coefficient solve (the double trig is the cost), copied to every
+  // stage/channel — their running state stays their own
+  Biquad c;
+  biquad_set(&c, F->type, fq, F->q, sr, false);
+  for (int st = 0; st < (F->x24 ? 2 : 1); st++)
+    for (int ch = 0; ch < 2; ch++) {
+      Biquad *b = &F->f[st][ch];
+      b->b0 = c.b0; b->b1 = c.b1; b->b2 = c.b2; b->a1 = c.a1; b->a2 = c.a2;
+    }
+}
+static inline float filt_run(Filt *F, float x, int ch) {
+  if (F->ladder) return ladder_run(&F->lad[ch], x, F->lad_cut, F->lad_k, F->lad_drive) * F->lad_makeup;
+  x = biquad_run(&F->f[0][ch], x);
+  return F->x24 ? biquad_run(&F->f[1][ch], x) : x;
+}
+
+// VOWEL (superdough vowel.mjs VowelNode, from webdirt): five PARALLEL
+// band-passes (Q linear), each through its formant gain, summed ×8 (makeup).
+// Rows in the bridge's index order; the unicode aliases resolve in the bridge.
+#define N_VOWELS 15
+static const float VOWEL_F[N_VOWELS][5] = {
+  {660, 1120, 2750, 3000, 3350}, {440, 1800, 2700, 3000, 3300}, {270, 1850, 2900, 3350, 3590},
+  {430, 820, 2700, 3000, 3300},  {370, 630, 2750, 3000, 3400},  {650, 1515, 2400, 3000, 3350},
+  {560, 900, 2570, 3000, 3300},  {500, 1430, 2300, 3000, 3300}, {250, 1750, 2150, 3200, 3300},
+  {400, 1460, 2400, 3000, 3300}, {600, 1250, 2100, 3100, 3500}, {500, 1240, 2280, 3000, 3500},
+  {600, 1480, 2450, 3200, 3300}, {700, 1050, 2500, 3000, 3300}, {500, 1080, 2350, 3000, 3300}};
+static const float VOWEL_G[N_VOWELS][5] = {
+  {1, 0.5012f, 0.0708f, 0.0631f, 0.0126f}, {1, 0.1995f, 0.1259f, 0.1f, 0.1f},
+  {1, 0.0631f, 0.0631f, 0.0158f, 0.0158f}, {1, 0.3162f, 0.0501f, 0.0794f, 0.01995f},
+  {1, 0.1f, 0.0708f, 0.0316f, 0.01995f},   {1, 0.5f, 0.1008f, 0.0631f, 0.0126f},
+  {1, 0.5f, 0.0708f, 0.0631f, 0.0126f},    {1, 0.2f, 0.0708f, 0.0316f, 0.01995f},
+  {1, 0.1f, 0.0708f, 0.0316f, 0.01995f},   {1, 0.2f, 0.0708f, 0.0316f, 0.02995f},
+  {1, 0.3f, 0.0608f, 0.0316f, 0.01995f},   {1, 0.1f, 0.1708f, 0.0216f, 0.02995f},
+  {1, 0.15f, 0.0708f, 0.0316f, 0.02995f},  {1, 0.1f, 0.0708f, 0.0316f, 0.02995f},
+  {1, 0.1f, 0.0708f, 0.0316f, 0.02995f}};
+static const float VOWEL_Q[N_VOWELS][5] = {
+  {80, 90, 120, 130, 140}, {70, 80, 100, 120, 120}, {40, 90, 100, 120, 120}, {40, 80, 100, 120, 120},
+  {40, 60, 100, 120, 120}, {80, 90, 120, 130, 140}, {80, 90, 120, 130, 140}, {40, 60, 100, 120, 120},
+  {40, 60, 100, 120, 120}, {40, 60, 100, 120, 120}, {40, 70, 100, 120, 130}, {40, 60, 100, 120, 120},
+  {40, 60, 100, 120, 120}, {40, 60, 100, 120, 120}, {40, 60, 100, 120, 120}};
+typedef struct {
+  bool on;
+  float g[5];
+  Biquad f[5][2]; // [formant][channel]
+} Vowel;
+static void vowel_setup(Vowel *w, int idx, float sr) {
+  w->on = idx >= 0 && idx < N_VOWELS;
+  if (!w->on) return;
+  for (int i = 0; i < 5; i++) {
+    w->g[i] = VOWEL_G[idx][i];
+    for (int ch = 0; ch < 2; ch++) biquad_bandpass(&w->f[i][ch], VOWEL_F[idx][i], VOWEL_Q[idx][i], sr);
+  }
+}
+static inline float vowel_run(Vowel *w, float x, int ch) {
+  float y = 0;
+  for (int i = 0; i < 5; i++) y += w->g[i] * biquad_run(&w->f[i][ch], x);
+  return y * 8.0f; // makeupGain
 }
 
 // ---------- voices ------------------------------------------------------------
 enum Source { SRC_SINE = 0, SRC_SAW, SRC_SQUARE, SRC_TRIANGLE, SRC_SUPERSAW, SRC_SAMPLE,
-              SRC_WHITE, SRC_PINK, SRC_BROWN, SRC_CRACKLE };
+              SRC_WHITE, SRC_PINK, SRC_BROWN, SRC_CRACKLE, SRC_PULSE };
+// Chrome PEAK-NORMALIZES its built-in sawtooth and square (PeriodicWave: scale
+// = 1/max of the full-band table — the Gibbs overshoot). MEASURED in Chromium
+// (OfflineAudioContext, 2026-09-23): saw rms .4894 vs the series' .5774, square
+// .8476 vs 1.0 — both ×0.8477. zaltz played them +1.43dB hot until then.
+// Sine and triangle have no overshoot: unscaled, identical to Chrome.
+#define WA_NORM 0.8477f
 #define MAX_UNISON 16 /* superdough clamps 1..100; corpus uses the default 5 */
 
 // xorshift32 — random initial phases per supersaw voice (worklets.mjs:559
@@ -347,7 +533,8 @@ typedef struct {
   bool penv_on;
   Adsr penv_env;
   float penv_min, penv_max;
-  float crush; // bit reduce: round(x·2^(crush−1))/2^(crush−1) (webdirt)
+  bool crush_on; // CrushProcessor runs whenever crush is SET (crush(0) quantizes too)
+  float crush; // bit reduce: round(x·2^(crush−1))/2^(crush−1), crush = max(1, crush)
   int coarse;  // sample-hold every N samples (webdirt)
   float coarse_hold_l, coarse_hold_r;
   int coarse_ctr;
@@ -360,29 +547,8 @@ typedef struct {
   float fan[MAX_UNISON];       // per-voice semitone offsets (getDetuner)
   double ss_phase[MAX_UNISON]; // random initial phases
   float ss_gl, ss_gr;          // alternating √panspread gains
-  Biquad lpf;
-  Biquad hpf;
-  Biquad lpf_r; // right-channel twins for the stereo (supersaw) path
-  Biquad hpf_r;
-  // ftype("ladder") replaces the lp biquad; ftype("24db") cascades a second
-  bool ladder_on;
-  Ladder lad, lad_r;
-  float lad_cut, lad_k, lad_drive, lad_makeup;
-  bool lp24;
-  Biquad lpf2, lpf2_r;
-  // superdough QUIRK kept verbatim (superdough.mjs:706 model:'ftype'): under
-  // ftype("ladder"), hpf() builds ANOTHER ladder — a LOWPASS topology — at
-  // the hpf frequency. The corpus was authored with this sound.
-  bool hladder_on;
-  Ladder hlad, hlad_r;
-  float hlad_cut, hlad_k, hlad_drive, hlad_makeup;
-  bool hp24;
-  Biquad hpf2, hpf2_r;
-  // FILTER ENVELOPE (superdough createFilter, helpers.mjs:219 — exponential
-  // curve, defaults [0.005, 0.14, 0, 0.1]): frequency glides fmin↔fmax
-  bool lp_env_active;
-  Adsr lp_env;
-  float lp_fmin, lp_fmax, lp_qdb;
+  Filt flt[3]; // lp → hp → bp (the filter family above)
+  Vowel vow;   // after the filters (superdough.mjs:751)
   // RETIRE (the crossfade takeover): the OLD music fades out under the new
   // loop instead of being hushed — set on live voices by sd_retire and
   // inherited by voices spawned from pre-retire events
@@ -403,13 +569,32 @@ typedef struct {
   // VIB (helpers.mjs:346): detune cents = sin(2π·vib·t)·vibmod·100
   float vib_hz, vibmod;
   float base_freq;
+  float pitch_mult; // 2^(detune cents/1200) — vib + penv, control rate
+  // FM operator 1
+  bool fm_on, fm_env_on, fm_env_lin;
+  int fm_wave;
+  float fm_dev, fm_modfreq, fm_envval;
+  double fm_phase;
+  Adsr fm_env;
+  float fm_nb[7], fm_nlast; // noise-modulator state
+  // PULSE — half-Tomisawa (worklets.mjs PulseOscillatorProcessor), doubles like JS
+  double pl_phi, pl_y0, pl_y1, pl_dphif, pl_envf, pl_env;
+  float pl_pw, pw_depth, pw_rate;
+  bool pw_lfo, pl_live;
+  double pw_phase;
+  // noise mix (getNoiseMix → drywet)
+  bool nmix_on;
+  int trem_shape;
+  double nudge_frames; // sampler nudge: buffer start offset from the envelope
+  float nmix_dry, nmix_wet;
+  const float *ptab; // partials table (waveformN), NULL = the stock wave
   // SAMPLE voice
   const float *pcm;
   int pcm_frames, pcm_channels;
   double pos;      // frames into the buffer
   double rate;     // playbackRate (buffer frames per output frame)
   double base_rate;
-  double end_frame; // end fraction × frames
+  bool rev; // speed < 0: the WHOLE buffer reads reversed (getSampleBufferSource)
   bool smp_loop;
   double loop_a, loop_b;
   // PHASE VOCODER (stretch): superdough spawns a fresh phase-vocoder worklet
@@ -425,6 +610,21 @@ typedef struct {
   float attack, decay, sustain, release;
   float gain, velocity, postgain, pan;
   float lpf, lpq, hpf, hpq;
+  float hpattack, hpdecay, hpsustain, hprelease, hpenv;
+  float bandf, bandq, bpattack, bpdecay, bpsustain, bprelease, bpenv;
+  float fanchor;
+  int vowel; // formant row, −1 = none
+  // FM operator 1 (helpers.mjs applyFM): fmi Hz-per-unit·modfreq, ratio fmh
+  float fmi, fmh, fmattack, fmdecay, fmsustain, fmrelease;
+  int fmwave;     // 0 sine 1 square 2 sawtooth 3 triangle 4 white 5 pink 6 brown 7 crackle
+  bool fmenv_lin; // fmenv "lin" (default "exp")
+  // PULSE (synth.mjs 'pulse'): width + the resolved pw LFO (bridge applies the defaults)
+  float pw, pwrate, pwsweep;
+  float noise;    // getOscillator noise mix (pink, drywet)
+  float djf;      // orbit DJ filter value (NaN = not set)
+  int tremoloshape; // −1 unset · 0 tri 1 sine 2 ramp 3 saw 4 square
+  float nudge;    // sampler: the buffer starts `nudge` s after the envelope
+  int partials;   // getOscillator: partials ?? n → waveformN (0 = stock wave)
   float unison, spread, detune;
   float lpattack, lpdecay, lpsustain, lprelease, lpenv;
   int ftype;   // 0 = 12db biquad, 1 = ladder, 2 = 24db (superdough.mjs:362)
@@ -495,6 +695,57 @@ static int wt_level_for(float freq) {
   return lvl;
 }
 
+// waveformN (synth.mjs:457) — `partials ?? n` harmonics of the wave's own
+// series (saw imag −1/n · square imag 1/n odd · triangle real 1/n² odd),
+// peak-normalized from the FULL series (PeriodicWave, disableNormalization
+// false), then band-limited to the note (partials past Nyquist dropped, the
+// scale kept) like Chrome's range tables. Cached per (wave, count, band).
+static float sr_f; // tentative — defined with the orbit code below
+static double inv_sr = 1.0 / 48000.0; // set in sd_init
+#define PT_SLOTS 12
+typedef struct { int src, n, ne; float tab[WT_LEN + 1]; } PTab;
+static PTab pt_cache[PT_SLOTS];
+static int pt_used = 0, pt_next = 0;
+static float pt_term_sin(int src, int k) {
+  if (src == SRC_SAW) return -1.0f / (float)k;
+  if (src == SRC_SQUARE) return (k & 1) ? 1.0f / (float)k : 0.0f;
+  return 0.0f;
+}
+static float pt_term_cos(int src, int k) {
+  return (src == SRC_TRIANGLE && (k & 1)) ? 1.0f / ((float)k * (float)k) : 0.0f;
+}
+static float pt_sum(int src, int n, float t) {
+  float acc = 0;
+  for (int k = 1; k <= n; k++) {
+    float a = pt_term_sin(src, k), b = pt_term_cos(src, k);
+    if (a != 0) acc += a * sd_sinf(TWO_PI * (float)k * t);
+    if (b != 0) acc += b * sd_cosf(TWO_PI * (float)k * t);
+  }
+  return acc;
+}
+static const float *partial_table(int src, int n, float freq) {
+  if (n > 1024) n = 1024;
+  int nyq = (int)((sr_f * 0.5f) / (freq > 1 ? freq : 1));
+  int ne = n < nyq ? n : nyq;
+  if (ne < 1) ne = 1;
+  for (int i = 0; i < pt_used; i++)
+    if (pt_cache[i].src == src && pt_cache[i].n == n && pt_cache[i].ne == ne) return pt_cache[i].tab;
+  PTab *p = &pt_cache[pt_next];
+  pt_next = (pt_next + 1) % PT_SLOTS;
+  if (pt_used < PT_SLOTS) pt_used++;
+  float mx = 0;
+  for (int i = 0; i < WT_LEN; i++) { // the normalization reads the FULL series
+    float x = pt_sum(src, n, (float)i / (float)WT_LEN);
+    if (x < 0) x = -x;
+    if (x > mx) mx = x;
+  }
+  float scale = mx > 0 ? 1.0f / mx : 1.0f;
+  for (int i = 0; i < WT_LEN; i++) p->tab[i] = pt_sum(src, ne, (float)i / (float)WT_LEN) * scale;
+  p->tab[WT_LEN] = p->tab[0];
+  p->src = src; p->n = n; p->ne = ne;
+  return p->tab;
+}
+
 // ---------- ORBIT BUSES (M4) — per-orbit delay, FDN reverb, duck ------------
 // superdough routing (superdough.mjs:938-955 + superdoughoutput.mjs): each
 // voice lives on an orbit; .room()/.delay() are SENDS into the orbit's shared
@@ -551,6 +802,7 @@ typedef struct {
   // reverb bus (send): 8-line Householder FDN tuned to the IR's T60 + damping
   bool verb_on;
   float t60, lp_hz;
+  float gen_size, gen_lp, gen_dim; // convolver.duration/lp/dim as last generated (defaults applied)
   float fdn[FDN_LINES][FDN_MAX];
   int fdn_len[FDN_LINES], fdn_pos[FDN_LINES];
   int fdn_fill; // samples written since enable — same no-zero law as dl_fill
@@ -572,6 +824,13 @@ typedef struct {
   // deck CHANNEL KILLS: per-orbit output gain, glided (~10ms tau) — a kill
   // silences already-ringing tails instantly-but-clicklessly, like kill EQ
   float out_g, out_g_tgt;
+  // DJ FILTER (superdoughoutput getDjf + worklets.mjs DJFProcessor): once an
+  // orbit has one it keeps it; each hap's djf is setValueAtTime(t) — read
+  // k-rate (value[0]), so a change lands on the first quantum starting ≥ t
+  bool djf_on;
+  float djf_val, djf_next;
+  double djf_at;
+  double djf_s0[2], djf_s1[2];
   // RETUNE targets: room params glide (authored fx sweep roomsize per hap!)
   // — coefficients ramp toward these per block; the ring NEVER resets live
   float fdn_g_tgt[FDN_LINES];
@@ -685,6 +944,26 @@ static void orbit_config_verb(Orbit *o, float t60, float lp, float dim) {
   }
 }
 
+/** getReverb (superdoughoutput.mjs:69-92): the orbit's room regenerates only
+ *  when a value the hap SET differs from what was last generated; the
+ *  regeneration then takes generate()'s defaults (2s, lp 15000, dim 1000) for
+ *  everything the hap left unset. THE DEFAULT ROOM DARKENS (2026-09-23): every
+ *  superdough IR runs applyGradualLowpass lp → dim, and dim defaults to 1000 —
+ *  so an unset room's highs die early (T60 5k/500 ≈ .71). zaltz used to skip
+ *  the dim for unset rooms (.90): every default tail rang brighter than
+ *  strudel.cc. engine/golden/rdim.mjs now asserts unset == dim 1000. */
+static void orbit_room(Orbit *o, float size, float lp, float dim) {
+  bool changed = !o->verb_on ||
+                 (!is_nan(size) && size != o->gen_size) ||
+                 (!is_nan(lp) && lp != o->gen_lp) ||
+                 (!is_nan(dim) && dim != o->gen_dim);
+  if (!changed) return;
+  o->gen_size = is_nan(size) ? 2.0f : size;
+  o->gen_lp = is_nan(lp) ? 15000.0f : lp;
+  o->gen_dim = is_nan(dim) ? 1000.0f : dim;
+  orbit_config_verb(o, o->gen_size, o->gen_lp, o->gen_dim);
+}
+
 static void orbit_config_delay(Orbit *o, float dt, float fb) {
   if (!o->delay_on) {
     int len = (int)(sr_f * 2.0f); // 2s max line
@@ -701,7 +980,10 @@ static void orbit_config_delay(Orbit *o, float dt, float fb) {
     o->dt_cur = dt;
     o->fb_cur = fb;
   }
-  o->dt_tgt = sd_fminf(sd_fmaxf(dt, 0.001f), 1.99f);
+  // FeedbackDelayNode is `super(ac)` → DelayNode maxDelayTime 1s, so longer
+  // times clamp to 1s; a DelayNode inside a cycle is at least one render
+  // quantum (Web Audio §1.21)
+  o->dt_tgt = sd_fminf(sd_fmaxf(dt, (float)BLOCK / sr_f), 1.0f);
   o->fb_tgt = sd_fminf(sd_fmaxf(fb, 0.0f), 0.98f); // superdoughoutput clamp
 }
 
@@ -894,6 +1176,7 @@ __attribute__((export_name("sd_hush"))) void sd_hush(void) {
     orbits[i].delay_on = false;
     orbits[i].verb_on = false;
     orbits[i].duck_active = false;
+    orbits[i].djf_on = false;
     orbits[i].duck_g = 1.0f;
     orbits[i].out_g = 1.0f;
     orbits[i].out_g_tgt = 1.0f;
@@ -902,6 +1185,7 @@ __attribute__((export_name("sd_hush"))) void sd_hush(void) {
 
 __attribute__((export_name("sd_init"))) void sd_init(float sample_rate) {
   sr_f = sample_rate;
+  inv_sr = 1.0 / (double)sample_rate;
   engine_frame = 0;
   build_wavetables(sample_rate); // ONCE per boot — never on the hush path
   pv_tables_init();              // FFT twiddles + Hann, once
@@ -916,6 +1200,15 @@ __attribute__((export_name("sd_event"))) int sd_event(void) {
   ev.gain = 0.8f; // defaultControls gain (superdough.mjs:182) — NOT 1: unset layers read +1.94dB
   ev.velocity = 1; ev.postgain = 1; ev.pan = NAN_F; // NaN = unset → no panner (superdough.mjs:843)
   ev.lpf = 0; ev.lpq = 1; ev.hpf = 0; ev.hpq = 1;
+  ev.hpattack = NAN_F; ev.hpdecay = NAN_F; ev.hpsustain = NAN_F; ev.hprelease = NAN_F; ev.hpenv = NAN_F;
+  ev.bandf = 0; ev.bandq = 1; // createFilter q default 1 (LINEAR for the bandpass)
+  ev.bpattack = NAN_F; ev.bpdecay = NAN_F; ev.bpsustain = NAN_F; ev.bprelease = NAN_F; ev.bpenv = NAN_F;
+  ev.vowel = -1;
+  ev.fmi = 0; ev.fmh = 1; ev.fmwave = 0; ev.fmenv_lin = false;
+  ev.fmattack = NAN_F; ev.fmdecay = NAN_F; ev.fmsustain = NAN_F; ev.fmrelease = NAN_F;
+  ev.pw = 0.5f; ev.pwrate = 1; ev.pwsweep = 0; ev.noise = 0; ev.partials = 0;
+  ev.djf = NAN_F; ev.tremoloshape = -1; ev.nudge = 0;
+  ev.fanchor = NAN_F; // createFilter anchor: nanFallback(anchor, 0) — no default consulted
   ev.unison = 5; ev.spread = 0.6f; ev.detune = NAN_F; // supersaw defaults (synth.mjs:157-158)
   ev.lpattack = NAN_F; ev.lpdecay = NAN_F; ev.lpsustain = NAN_F; ev.lprelease = NAN_F; ev.lpenv = NAN_F;
   ev.ftype = 0; ev.drive = 0.69f; ev.density = 0.02f;
@@ -924,17 +1217,24 @@ __attribute__((export_name("sd_event"))) int sd_event(void) {
   ev.vib = 0; ev.vibmod = 0.5f; // helpers.mjs:347
   ev.sample_id = -1; ev.speed = 1; ev.begin = 0; ev.endf = 1; ev.loopv = 0; ev.loop_begin = 0; ev.loop_end = 1;
   ev.orbit = 1;
-  ev.room = 0; ev.roomsize = 2; ev.roomlp = 15000; ev.roomdim = NAN_F; ev.delay = 0;
-  ev.delaytime = 0.25f; ev.delayfeedback = 0.5f; // superdough defaults
+  // room params stay UNSET (NaN) unless the hap names them: superdough only
+  // regenerates an orbit's room for a value a hap actually SET (hasChanged,
+  // superdoughoutput.mjs:14) — a layer without roomsize must not drag a
+  // shared orbit's size back to 2
+  ev.room = 0; ev.roomsize = NAN_F; ev.roomlp = NAN_F; ev.roomdim = NAN_F; ev.delay = 0;
+  // superdough: delaytime ?? delaysync(3/16 cycle) / cps — 0.375s at its default
+  // cps 0.5. Klappn's bridge always sends the tempo-true value; this is the
+  // fallback for hosts that speak to the engine directly (the npm package).
+  ev.delaytime = 0.375f; ev.delayfeedback = 0.5f;
   ev.shape = NAN_F; ev.shapevol = 1;
   ev.distort = NAN_F; ev.distortvol = 1; ev.distorttype = 0; // superdough DEFAULT_VALUES
-  ev.tremolo = NAN_F; ev.tremolodepth = 1; ev.tremoloskew = 1; // skew default 1 when no tremoloshape (superdough.mjs:818)
+  ev.tremolo = NAN_F; ev.tremolodepth = 1; ev.tremoloskew = NAN_F; // default: 1, or .5 once a shape is named (superdough.mjs:818)
   ev.tremolophase = 0; ev.tremtime = 0;
   ev.penv = NAN_F; ev.pattack = NAN_F; ev.pdecay = NAN_F; ev.psustain = NAN_F;
   ev.prelease = NAN_F; ev.panchor = NAN_F;
   ev.stretch = NAN_F;
   ev.duck_n = 0; ev.duckonset = 0; ev.duckattack = 0.1f; ev.duckdepth = 1;
-  ev.crush = 0; ev.coarse = 0; ev.cut = -1;
+  ev.crush = NAN_F; ev.coarse = 0; ev.cut = -1;
   ev.src = SRC_TRIANGLE; // superdough default osc type (synth getOscillator)
 
   char *p = event_buf;
@@ -976,6 +1276,36 @@ __attribute__((export_name("sd_event"))) int sd_event(void) {
     else if (str_eq(key, "lpsustain") || str_eq(key, "lps")) ev.lpsustain = parse_f(val);
     else if (str_eq(key, "lprelease") || str_eq(key, "lpr")) ev.lprelease = parse_f(val);
     else if (str_eq(key, "lpenv") || str_eq(key, "lpe")) ev.lpenv = parse_f(val);
+    else if (str_eq(key, "hpattack") || str_eq(key, "hpa")) ev.hpattack = parse_f(val);
+    else if (str_eq(key, "hpdecay") || str_eq(key, "hpd")) ev.hpdecay = parse_f(val);
+    else if (str_eq(key, "hpsustain") || str_eq(key, "hps")) ev.hpsustain = parse_f(val);
+    else if (str_eq(key, "hprelease") || str_eq(key, "hpr")) ev.hprelease = parse_f(val);
+    else if (str_eq(key, "hpenv") || str_eq(key, "hpe")) ev.hpenv = parse_f(val);
+    else if (str_eq(key, "bandf") || str_eq(key, "bpf")) ev.bandf = parse_f(val);
+    else if (str_eq(key, "bandq") || str_eq(key, "bpq")) ev.bandq = parse_f(val);
+    else if (str_eq(key, "bpattack") || str_eq(key, "bpa")) ev.bpattack = parse_f(val);
+    else if (str_eq(key, "bpdecay") || str_eq(key, "bpd")) ev.bpdecay = parse_f(val);
+    else if (str_eq(key, "bpsustain") || str_eq(key, "bps")) ev.bpsustain = parse_f(val);
+    else if (str_eq(key, "bprelease") || str_eq(key, "bpr")) ev.bprelease = parse_f(val);
+    else if (str_eq(key, "bpenv") || str_eq(key, "bpe")) ev.bpenv = parse_f(val);
+    else if (str_eq(key, "fanchor")) ev.fanchor = parse_f(val);
+    else if (str_eq(key, "vowel")) ev.vowel = (int)parse_f(val); // the bridge sends the row index
+    else if (str_eq(key, "fmi") || str_eq(key, "fm")) ev.fmi = parse_f(val);
+    else if (str_eq(key, "fmh")) ev.fmh = parse_f(val);
+    else if (str_eq(key, "fmwave")) ev.fmwave = (int)parse_f(val);
+    else if (str_eq(key, "fmenv")) ev.fmenv_lin = parse_f(val) > 0;
+    else if (str_eq(key, "fmattack")) ev.fmattack = parse_f(val);
+    else if (str_eq(key, "fmdecay")) ev.fmdecay = parse_f(val);
+    else if (str_eq(key, "fmsustain")) ev.fmsustain = parse_f(val);
+    else if (str_eq(key, "fmrelease")) ev.fmrelease = parse_f(val);
+    else if (str_eq(key, "pw")) ev.pw = parse_f(val);
+    else if (str_eq(key, "pwrate")) ev.pwrate = parse_f(val);
+    else if (str_eq(key, "pwsweep")) ev.pwsweep = parse_f(val);
+    else if (str_eq(key, "noise")) ev.noise = parse_f(val);
+    else if (str_eq(key, "partials")) ev.partials = (int)parse_f(val);
+    else if (str_eq(key, "djf")) ev.djf = parse_f(val);
+    else if (str_eq(key, "tremoloshape")) ev.tremoloshape = (int)parse_f(val);
+    else if (str_eq(key, "nudge")) ev.nudge = parse_f(val);
     else if (str_eq(key, "ftype")) ev.ftype = str_eq(val, "ladder") ? 1 : str_eq(val, "24db") ? 2 : 0;
     else if (str_eq(key, "drive")) ev.drive = parse_f(val);
     else if (str_eq(key, "density")) ev.density = parse_f(val);
@@ -1048,9 +1378,10 @@ __attribute__((export_name("sd_event"))) int sd_event(void) {
       }
     }
     else if (str_eq(key, "s") || str_eq(key, "sound")) {
-      if (str_eq(val, "sine")) ev.src = SRC_SINE;
+      if (str_eq(val, "sine") || str_eq(val, "sin")) ev.src = SRC_SINE;
       else if (str_eq(val, "sawtooth") || str_eq(val, "saw")) ev.src = SRC_SAW;
-      else if (str_eq(val, "square")) ev.src = SRC_SQUARE;
+      else if (str_eq(val, "square") || str_eq(val, "sqr")) ev.src = SRC_SQUARE;
+      else if (str_eq(val, "pulse")) ev.src = SRC_PULSE;
       else if (str_eq(val, "triangle") || str_eq(val, "tri")) ev.src = SRC_TRIANGLE;
       else if (str_eq(val, "supersaw")) ev.src = SRC_SUPERSAW;
       else if (str_eq(val, "sample")) ev.src = SRC_SAMPLE;
@@ -1124,6 +1455,9 @@ static void start_voice(const Event *ev) {
       v->env = adsr_values(ev->attack, ev->decay, ev->sustain, ev->release,
                            0.001f, 0.05f, 0.6f, 0.01f);
       v->amp = 0.3f * ev->gain * ev->velocity; // 0.3 headroom, synth.mjs:54
+      // the PULSE env peaks at 1, not 0.3 (synth.mjs 'pulse': getParamADSR(…, 0, 1))
+      // — its 0.15 level lives inside the worklet
+      if (ev->src == SRC_PULSE) v->amp = ev->gain * ev->velocity;
     }
     v->end = ev->duration + v->env.release + 0.01f; // envEnd, synth.mjs:69
     // StereoPanner equal-power ONLY when pan is set (superdough.mjs:843) —
@@ -1141,64 +1475,13 @@ static void start_voice(const Event *ev) {
       v->pan_r = sd_sinf(ang);
     }
     v->postgain = ev->postgain;
-    v->lpf.active = false;
-    v->ladder_on = false;
-    v->lp24 = false;
-    if (ev->lpf > 0) {
-      if (ev->ftype == 1) {
-        // ladder replaces the biquad wholesale (helpers.mjs:238-240)
-        v->ladder_on = true;
-        v->lad = (Ladder){0}; v->lad_r = (Ladder){0};
-        v->lad_cut = ladder_cut(ev->lpf, sr_f);
-        float k = sd_fminf(8.0f, ev->lpq * 0.13f); // worklets.mjs:405
-        v->lad_k = k;
-        float dr = sd_exp2f(ev->drive * 1.44269504089f); // exp(drive)
-        if (dr < 0.1f) dr = 0.1f; else if (dr > 2000.0f) dr = 2000.0f;
-        v->lad_drive = dr;
-        v->lad_makeup = (1.0f / dr) * sd_fminf(1.75f, 1.0f + k); // worklets.mjs:407-409
-      } else {
-        biquad_lowpass(&v->lpf, ev->lpf, ev->lpq, sr_f);
-        if (ev->ftype == 2) { v->lp24 = true; v->lpf2 = v->lpf; } // 24db = 2nd identical biquad (superdough.mjs:687)
-      }
-    }
-    v->hpf.active = false;
-    v->hladder_on = false;
-    v->hp24 = false;
-    if (ev->hpf > 0) {
-      if (ev->ftype == 1) {
-        v->hladder_on = true;
-        v->hlad = (Ladder){0}; v->hlad_r = (Ladder){0};
-        v->hlad_cut = ladder_cut(ev->hpf, sr_f);
-        float hk = sd_fminf(8.0f, ev->hpq * 0.13f);
-        v->hlad_k = hk;
-        float hdr = sd_exp2f(ev->drive * 1.44269504089f);
-        if (hdr < 0.1f) hdr = 0.1f; else if (hdr > 2000.0f) hdr = 2000.0f;
-        v->hlad_drive = hdr;
-        v->hlad_makeup = (1.0f / hdr) * sd_fminf(1.75f, 1.0f + hk);
-      } else {
-        biquad_highpass(&v->hpf, ev->hpf, ev->hpq, sr_f);
-        if (ev->ftype == 2) { v->hp24 = true; v->hpf2 = v->hpf; }
-      }
-    }
-    // FILTER ENVELOPE (createFilter, helpers.mjs:250): active when any lp-env
-    // param is set; defaults [0.005, 0.14, 0, 0.1] exp; anchor 0 →
-    // fmin = lpf, fmax = 2^|lpenv| · lpf (swap when lpenv < 0)
-    v->lp_env_active = false;
-    if (ev->lpf > 0 &&
-        (!is_nan(ev->lpattack) || !is_nan(ev->lpdecay) || !is_nan(ev->lpsustain) ||
-         !is_nan(ev->lprelease) || !is_nan(ev->lpenv))) {
-      v->lp_env_active = true;
-      v->lp_env = adsr_values(ev->lpattack, ev->lpdecay, ev->lpsustain, ev->lprelease,
-                              0.005f, 0.14f, 0.0f, 0.1f);
-      float envv = is_nan(ev->lpenv) ? 1.0f : ev->lpenv;
-      float envabs = sd_fabsf(envv);
-      float fmin = ev->lpf;
-      float fmax = sd_fminf(sd_exp2f(envabs) * ev->lpf, 20000.0f);
-      if (envv < 0) { float tmpf = fmin; fmin = fmax; fmax = tmpf; }
-      v->lp_fmin = fmin;
-      v->lp_fmax = fmax;
-      v->lp_qdb = ev->lpq;
-    }
+    filt_setup(&v->flt[FT_LP], FT_LP, ev->lpf, ev->lpq, ev->ftype, ev->drive, ev->lpattack,
+               ev->lpdecay, ev->lpsustain, ev->lprelease, ev->lpenv, ev->fanchor, sr_f);
+    filt_setup(&v->flt[FT_HP], FT_HP, ev->hpf, ev->hpq, ev->ftype, ev->drive, ev->hpattack,
+               ev->hpdecay, ev->hpsustain, ev->hprelease, ev->hpenv, ev->fanchor, sr_f);
+    filt_setup(&v->flt[FT_BP], FT_BP, ev->bandf, ev->bandq, ev->ftype, ev->drive, ev->bpattack,
+               ev->bpdecay, ev->bpsustain, ev->bprelease, ev->bpenv, ev->fanchor, sr_f);
+    vowel_setup(&v->vow, ev->vowel, sr_f);
     v->nz_last = 0;
     for (int nzi = 0; nzi < 7; nzi++) v->nz_b[nzi] = 0;
     v->nz_density = ev->density;
@@ -1216,21 +1499,79 @@ static void start_voice(const Event *ev) {
     }
     v->vib_hz = ev->vib;
     v->vibmod = ev->vibmod;
-    v->lpf_r = v->lpf;
-    v->hpf_r = v->hpf;
-    v->lpf2_r = v->lpf2;
-    v->hpf2_r = v->hpf2;
+    v->pitch_mult = 1.0f;
+    // FM (applyFM, operator 1): oscillators, supersaw and pulse only — the
+    // sampler and the noises never call it. modfreq = the carrier param's
+    // VALUE × fmh (vibrato/penv ride detune, not this); `if (!amt) continue`.
+    bool osc_src = ev->src == SRC_SINE || ev->src == SRC_SAW || ev->src == SRC_SQUARE ||
+                   ev->src == SRC_TRIANGLE || ev->src == SRC_SUPERSAW || ev->src == SRC_PULSE;
+    v->fm_on = osc_src && ev->fmi != 0 && !is_nan(ev->fmi);
+    if (v->fm_on) {
+      v->fm_modfreq = ev->freq * ev->fmh;
+      v->fm_dev = ev->fmi * v->fm_modfreq; // gain(amt) → gain(modfreq) → frequency (Hz)
+      v->fm_wave = ev->fmwave;
+      v->fm_phase = 0; // mod() starts it at scheduling time upstream — its phase is arbitrary there
+      v->fm_nlast = 0;
+      for (int k = 0; k < 7; k++) v->fm_nb[k] = 0;
+      v->fm_env_on = !is_nan(ev->fmattack) || !is_nan(ev->fmdecay) || !is_nan(ev->fmsustain) ||
+                     !is_nan(ev->fmrelease);
+      if (v->fm_env_on) {
+        v->fm_env = adsr_values(ev->fmattack, ev->fmdecay, ev->fmsustain, ev->fmrelease,
+                                0.001f, 0.001f, 1.0f, 0.01f); // bare getADSRValues
+        v->fm_env_lin = ev->fmenv_lin;
+      }
+      v->fm_envval = v->fm_env_on ? 0.001f : 1.0f;
+    }
+    // noise mix (getOscillator → getNoiseMix → drywet): stock oscillators only
+    v->nmix_on = ev->noise != 0 && (ev->src == SRC_SINE || ev->src == SRC_SAW ||
+                                    ev->src == SRC_SQUARE || ev->src == SRC_TRIANGLE);
+    if (v->nmix_on) {
+      float d = ev->noise, w = 1.0f - ev->noise; // wetfade: 1 until .5, then down to 0 at 1
+      v->nmix_dry = d < 0.5f ? 1.0f : 1.0f - (d - 0.5f) / 0.5f;
+      v->nmix_wet = w < 0.5f ? 1.0f : 1.0f - (w - 0.5f) / 0.5f;
+    }
+    // partials (getOscillator: `partials ?? n`, never for sine)
+    v->ptab = 0;
+    if (ev->partials > 0 && (ev->src == SRC_SAW || ev->src == SRC_SQUARE || ev->src == SRC_TRIANGLE))
+      v->ptab = partial_table(ev->src, ev->partials, ev->freq);
+    if (ev->src == SRC_PULSE) {
+      v->pl_phi = -3.14159265358979323846; v->pl_y0 = 0; v->pl_y1 = 0;
+      v->pl_dphif = 0; v->pl_envf = 0; v->pl_env = 1; v->pl_live = false;
+      v->pl_pw = ev->pw;
+      v->pw_lfo = ev->pwsweep != 0;
+      v->pw_depth = ev->pwsweep;
+      v->pw_rate = ev->pwrate;
+      // LFOProcessor: phase = ffrac(time·frequency), time = begin (absolute)
+      double seed = (ev->at_frame / (double)sr_f) * (double)ev->pwrate;
+      v->pw_phase = seed - (double)(long long)seed;
+      if (v->pw_phase < 0) v->pw_phase += 1.0;
+    }
     // ORBIT + SENDS (M4)
     int ob = ev->orbit;
     if (ob < 0) ob = 0;
     if (ob >= MAX_ORBITS) ob = MAX_ORBITS - 1;
     v->orbit = ob;
     orbits[ob].used = true;
-    v->room_send = sd_fminf(sd_fmaxf(ev->room, 0.0f), 1.0f);
-    v->delay_send = sd_fminf(sd_fmaxf(ev->delay, 0.0f), 1.0f);
-    if (v->room_send > 0) orbit_config_verb(&orbits[ob], ev->roomsize, ev->roomlp, ev->roomdim);
-    if (v->delay_send > 0) orbit_config_delay(&orbits[ob], ev->delaytime, ev->delayfeedback);
-    v->shape_on = !is_nan(ev->shape) && ev->shape > 0;
+    // sends are plain GainNodes (effectSend) — no ceiling, like superdough
+    v->room_send = sd_fmaxf(ev->room, 0.0f);
+    v->delay_send = sd_fmaxf(ev->delay, 0.0f);
+    if (v->room_send > 0) orbit_room(&orbits[ob], ev->roomsize, ev->roomlp, ev->roomdim);
+    if (!is_nan(ev->djf)) { // getDjf(value, t): the orbit gains its filter for good
+      Orbit *oo = &orbits[ob];
+      if (!oo->djf_on) {
+        oo->djf_on = true;
+        oo->djf_val = 0.5f; // DJFProcessor default until the first set lands
+        oo->djf_s0[0] = oo->djf_s0[1] = oo->djf_s1[0] = oo->djf_s1[1] = 0;
+      }
+      oo->djf_next = ev->djf;
+      oo->djf_at = ev->at_frame;
+    }
+    // superdough.mjs:955 — the orbit delay exists only when ALL three are > 0
+    if (v->delay_send > 0 && ev->delaytime > 0 && ev->delayfeedback > 0)
+      orbit_config_delay(&orbits[ob], ev->delaytime, ev->delayfeedback);
+    else
+      v->delay_send = 0;
+    v->shape_on = !is_nan(ev->shape); // ShapeProcessor runs whenever shape is set (shapevol applies at 0)
     if (v->shape_on) {
       // ShapeProcessor clamp — superdough's 1-4e-10 rounds to exactly 1.0f in
       // float32 (k would be inf → NaN into the orbit rings); stop a hair lower.
@@ -1239,7 +1580,7 @@ static void start_voice(const Event *ev) {
       float pg = ev->shapevol;
       v->shapevol = sd_fminf(sd_fmaxf(pg, 0.001f), 1.0f);
     }
-    v->dist_on = !is_nan(ev->distort) && ev->distort > 0;
+    v->dist_on = !is_nan(ev->distort); // distort(0) still applies distortvol (superdough.mjs:797)
     if (v->dist_on) {
       v->dist_k = sd_expm1f(ev->distort);            // DistortProcessor: expm1(distort)
       v->dist_pg = sd_clampf(ev->distortvol, 0.001f, 1.0f);
@@ -1250,7 +1591,9 @@ static void start_voice(const Event *ev) {
     if (v->trem_on) {
       v->trem_rate = ev->tremolo;
       v->trem_depth = is_nan(ev->tremolodepth) ? 1.0f : ev->tremolodepth;
-      v->trem_skew = is_nan(ev->tremoloskew) ? 1.0f : sd_clampf(ev->tremoloskew, 0.0f, 1.0f);
+      v->trem_shape = ev->tremoloshape < 0 ? 0 : ev->tremoloshape % 5;
+      v->trem_skew = !is_nan(ev->tremoloskew) ? sd_clampf(ev->tremoloskew, 0.0f, 1.0f)
+                                                : (ev->tremoloshape >= 0 ? 0.5f : 1.0f);
       v->trem_base = sd_fmaxf(1.0f - v->trem_depth, 0.0f); // amGain base (superdough.mjs:814)
       // LFOProcessor phase seed: ffrac(time·frequency + phaseoffset), where
       // time = the hap's cycle position in seconds (cycle/cps)
@@ -1279,7 +1622,8 @@ static void start_voice(const Event *ev) {
     v->pv_dead = false;
     v->pv_stretch = ev->stretch;
     if (!is_nan(ev->stretch)) v->pv = pv_alloc();
-    v->crush = ev->crush;
+    v->crush_on = !is_nan(ev->crush);
+    v->crush = v->crush_on ? sd_fmaxf(1.0f, ev->crush) : 0; // CrushProcessor: max(1, crush)
     v->coarse = ev->coarse >= 2 ? (int)ev->coarse : 0;
     v->coarse_ctr = 0;
     v->coarse_hold_l = v->coarse_hold_r = 0;
@@ -1315,15 +1659,20 @@ static void start_voice(const Event *ev) {
       v->pcm = arena_base + sm->offset;
       v->pcm_frames = sm->frames;
       v->pcm_channels = sm->channels;
-      double rate = ev->speed < 0 ? -ev->speed : ev->speed; // |speed| (sampler.mjs:36)
-      if (ev->speed < 0) rate = -rate; // REVERSE: read backwards
+      // AudioBufferSourceNode on superdough's buffer (sampler.mjs:36-80):
+      // playbackRate = |speed| (the bridge folds the pitch-map transpose in);
+      // speed < 0 REVERSES THE WHOLE BUFFER, then offset = begin·duration on
+      // that reversed buffer — so .begin(.25).speed(-1) starts at the ORIGINAL
+      // 75% point, reading down. `end` never stops the source: it only sets
+      // the hold (sliceDuration, computed by the bridge) — the voice plays to
+      // its release like any other and the buffer runs to its own end.
+      double rate = ev->speed < 0 ? -ev->speed : ev->speed;
+      v->rev = ev->speed < 0;
+      v->nudge_frames = ev->nudge > 0 ? (double)ev->nudge * (double)sr_f : 0; // a negative nudge plays as 0 here
       v->rate = rate;
       v->base_rate = rate;
-      v->pos = ev->speed < 0
-                 ? (double)ev->endf * (double)sm->frames - 1.0 // reverse starts at the end
-                 : (double)ev->begin * (double)sm->frames;
+      v->pos = (double)ev->begin * (double)sm->frames;
       if (v->pos < 0) v->pos = 0; // negative begin must never index the arena
-      v->end_frame = (double)ev->endf * (double)sm->frames;
       v->smp_loop = ev->loopv > 0;
       v->loop_a = (double)ev->loop_begin * (double)sm->frames;
       if (v->loop_a < 0) v->loop_a = 0;
@@ -1331,24 +1680,29 @@ static void start_voice(const Event *ev) {
     }
     if (ev->src == SRC_SUPERSAW) {
       // synth.mjs:156-170 + worklets.mjs SuperSawOscillatorProcessor
-      int u = (int)ev->unison;
-      if (u < 1) u = 1;
+      // voices = clamp(unison, 1, 100) (synth.mjs:168), a k-rate param the
+      // worklet loops `n < voices` over — a fractional count runs ⌈voices⌉
+      // saws while the detuner and the 1/√voices trim use the raw value
+      float uf = sd_clampf(ev->unison, 1.0f, 100.0f);
+      int u = (int)uf;
+      if ((float)u < uf) u++;
       if (u > MAX_UNISON) u = MAX_UNISON;
       v->unison = u;
       float fs = is_nan(ev->detune) ? 0.18f : ev->detune; // freqspread, semitones
-      // getDetuner (worklets.mjs:38): idx·(fs/(u−1)) − fs/2
+      if (fs < 0) fs = 0; // freqspread param min 0 (worklets.mjs:511)
+      // getDetuner (worklets.mjs:38): idx·(fs/(voices−1)) − fs/2; 0 when voices < 2
       for (int k = 0; k < u; k++) {
-        v->fan[k] = u < 2 ? 0.0f : (float)k * (fs / (float)(u - 1)) - fs * 0.5f;
+        v->fan[k] = uf < 2 ? 0.0f : (float)k * (fs / (uf - 1.0f)) - fs * 0.5f;
         v->ss_phase[k] = (double)frandf();
       }
       // panspread → alternating √ gains (worklets.mjs:544-548):
       // ps = spread·0.5+0.5; gainL = √(1−ps), gainR = √ps, swapped per voice
-      float ps = u > 1 ? sd_fminf(sd_fmaxf(ev->spread, 0.0f), 1.0f) : 0.0f;
+      float ps = uf > 1 ? sd_fminf(sd_fmaxf(ev->spread, 0.0f), 1.0f) : 0.0f;
       ps = ps * 0.5f + 0.5f;
       v->ss_gl = sd_sqrtf(1.0f - ps);
       v->ss_gr = sd_sqrtf(ps);
       // env max is 0.3·(1/√voices) (synth.mjs:186,195): fold 1/√u into amp
-      v->amp /= sd_sqrtf((float)u);
+      v->amp /= sd_sqrtf(uf);
     }
     return;
   }
@@ -1462,7 +1816,6 @@ static inline float lfo_tri(float phase, float skew) {
   return phase / skew;
 }
 
-static inline float sd_roundf(float x) { return (float)(int)(x + (x >= 0 ? 0.5f : -0.5f)); }
 
 // ---------- PHASE VOCODER — phaze port (worklets.mjs PhaseVocoderProcessor +
 // ola-processor.js + fft.js), term for term ----------------------------------
@@ -1875,10 +2228,10 @@ static inline void voice_pre_pan(Voice *v, float *al, float *ar) {
     v->coarse_ctr++;
     if (v->coarse_ctr >= v->coarse) v->coarse_ctr = 0;
   }
-  if (v->crush >= 1.0f) {
-    float x = sd_exp2f(v->crush - 1.0f); // webdirt: round(x·2^(crush−1))/2^(crush−1)
-    *al = sd_roundf(*al * x) / x;
-    *ar = sd_roundf(*ar * x) / x;
+  if (v->crush_on) {
+    float x = sd_exp2f(v->crush - 1.0f); // CrushProcessor: Math.round(x·2^(crush−1))/2^(crush−1)
+    *al = sd_floorf(*al * x + 0.5f) / x; // Math.round: halves go UP (−2.5 → −2)
+    *ar = sd_floorf(*ar * x + 0.5f) / x;
   }
   if (v->shape_on) {
     *al = shape_drive(*al, v->shape_k, v->shapevol);
@@ -1892,7 +2245,15 @@ static inline void voice_pre_pan(Voice *v, float *al, float *ar) {
   // TREMOLO: base amGain max(1−depth,0) + LFO tri(phase, skew), curved 1.5
   // (LFOProcessor: modval = pow(tri·depth, 1.5), clamped [0,1])
   if (v->trem_on) {
-    float w = lfo_tri((float)v->trem_phase, v->trem_skew) * v->trem_depth;
+    float ph = (float)v->trem_phase, shp; // worklets.mjs waveshapes
+    switch (v->trem_shape) {
+      case 1: shp = sd_sinf(TWO_PI * ph) * 0.5f + 0.5f; break;  // sine
+      case 2: shp = ph; break;                                   // ramp
+      case 3: shp = 1.0f - ph; break;                            // saw
+      case 4: shp = ph >= v->trem_skew ? 0.0f : 1.0f; break;     // square
+      default: shp = lfo_tri(ph, v->trem_skew);                  // tri
+    }
+    float w = shp * v->trem_depth;
     if (w < 0) w = 0;
     w = w * sd_sqrtf(w); // pow(x, 1.5) for x ≥ 0
     if (w > 1) w = 1;
@@ -2058,22 +2419,36 @@ __attribute__((export_name("sd_dsp"))) void sd_dsp(void) {
       // exponential glides and keeps coefficients cheap
       if (((int)(f - v->start_frame) & 15) == 0) {
         if (v->vib_hz > 0 || v->penv_on) {
-          float mult = 1.0f;
-          if (v->vib_hz > 0) {
-            float cents = sd_sinf(TWO_PI * v->vib_hz * tt) * v->vibmod * 100.0f;
-            mult *= sd_exp2f(cents / 1200.0f);
-          }
+          // both modulators land on ONE detune param (cents), summed
+          float cents_sum = 0.0f;
+          if (v->vib_hz > 0) cents_sum += sd_sinf(TWO_PI * v->vib_hz * tt) * v->vibmod * 100.0f;
           if (v->penv_on) {
             // getPitchEnvelope: detune cents ride the param ADSR between
             // min=−cents·anchor and max=cents−cents·anchor (linear curve;
             // pcurve exponential falls back to linear here — negative-cents
             // ranges can't ride an exponential ramp anyway)
             float e01 = adsr_at(&v->penv_env, tt, v->dur);
-            float cents = v->penv_min + (v->penv_max - v->penv_min) * e01;
-            mult *= sd_exp2f(cents / 1200.0f);
+            cents_sum += v->penv_min + (v->penv_max - v->penv_min) * e01;
           }
+          // the SUPERSAW worklet's detune AudioParam has min 0 (worklets.mjs:
+          // 514) and Web Audio clamps to the nominal range — vibrato only bends
+          // UP there, and a default penv (anchor = sustain = 1 → range ≤ 0)
+          // does nothing at all. Oscillator/buffer detune params are unbounded.
+          if (v->src == SRC_SUPERSAW && cents_sum < 0) cents_sum = 0;
+          float mult = sd_exp2f(cents_sum / 1200.0f);
           if (v->src == SRC_SAMPLE) v->rate = v->base_rate * (double)mult;
-          else v->phase_inc = (double)(v->base_freq * mult) / (double)sr_f;
+          else v->pitch_mult = mult;
+        }
+        if (v->fm_on && v->fm_env_on)
+          v->fm_envval = v->fm_env_lin ? adsr_at(&v->fm_env, tt, v->dur)
+                                       : adsr_exp_at(&v->fm_env, tt, v->dur, 0.0f, 1.0f);
+        // without FM the frequency only moves with detune → control rate
+        if (!v->fm_on && v->src != SRC_SAMPLE) {
+          double f0 = v->base_freq;
+          if ((v->src == SRC_SUPERSAW || v->src == SRC_PULSE) && f0 < 1e-9) f0 = 1e-9;
+          f0 *= (double)v->pitch_mult;
+          const double nq = 0.5 * (double)sr_f;
+          v->phase_inc = (f0 > nq ? nq : f0 < -nq ? -nq : f0) * inv_sr;
         }
         if (v->phaser_on) {
           // LFO = unipolar TRIANGLE (waveshapes.tri, shape index 0), phase
@@ -2087,29 +2462,17 @@ __attribute__((export_name("sd_dsp"))) void sd_dsp(void) {
           biquad_notch(&v->ph_l, fq, v->ph_q, sr_f);
           biquad_notch(&v->ph_r, fq, v->ph_q, sr_f);
         }
-        if (v->lp_env_active) {
-          float fenv = adsr_exp_at(&v->lp_env, tt, v->dur, v->lp_fmin, v->lp_fmax);
-          if (v->ladder_on) {
-            v->lad_cut = ladder_cut(fenv, sr_f); // env rides the worklet's frequency param
-          } else {
-            biquad_lowpass_coeffs(&v->lpf, fenv, v->lp_qdb, sr_f);
-            if (v->lp24) {
-              biquad_lowpass_coeffs(&v->lpf2, fenv, v->lp_qdb, sr_f);
-              if (v->src == SRC_SUPERSAW) biquad_lowpass_coeffs(&v->lpf2_r, fenv, v->lp_qdb, sr_f);
-            }
-            if (v->src == SRC_SUPERSAW) biquad_lowpass_coeffs(&v->lpf_r, fenv, v->lp_qdb, sr_f);
-          }
-        }
+        for (int fk = 0; fk < 3; fk++) filt_env(&v->flt[fk], tt, v->dur, sr_f);
       }
       if (v->src == SRC_SAMPLE) {
         float xs = 0, xs_r = 0;
-        bool in_range = v->rate < 0
-                          ? v->pos >= 0 && v->pos < (double)v->pcm_frames
-                          : v->pos >= 0 && v->pos < v->end_frame && v->pos < (double)v->pcm_frames;
+        bool nudged = (f - v->start_frame) < v->nudge_frames; // the buffer hasn't started yet
+        bool in_range = !nudged && v->pos >= 0 && v->pos < (double)v->pcm_frames;
         if (in_range) {
           int i0 = (int)v->pos;
           float fr = (float)(v->pos - (double)i0);
           int i1 = i0 + 1 < v->pcm_frames ? i0 + 1 : i0;
+          if (v->rev) { i0 = v->pcm_frames - 1 - i0; i1 = v->pcm_frames - 1 - i1; } // reversed buffer
           if (v->pcm_channels == 1) {
             xs = v->pcm[i0] + (v->pcm[i1] - v->pcm[i0]) * fr;
             xs_r = xs;
@@ -2126,21 +2489,14 @@ __attribute__((export_name("sd_dsp"))) void sd_dsp(void) {
         float env = adsr_at(&v->env, tt, v->dur);
         float al = xs * v->amp * env;
         float ar = xs_r * v->amp * env;
-        if (v->ladder_on) {
-          al = ladder_run(&v->lad, al, v->lad_cut, v->lad_k, v->lad_drive) * v->lad_makeup;
-          ar = v->pcm_channels == 1 ? al : ladder_run(&v->lad_r, ar, v->lad_cut, v->lad_k, v->lad_drive) * v->lad_makeup;
-        } else if (v->lpf.active) {
-          al = biquad_run(&v->lpf, al);
-          ar = v->pcm_channels == 1 ? al : biquad_run(&v->lpf_r, ar);
-          if (v->lp24) { al = biquad_run(&v->lpf2, al); ar = v->pcm_channels == 1 ? al : biquad_run(&v->lpf2_r, ar); }
+        for (int fk = 0; fk < 3; fk++) {
+          if (!v->flt[fk].on) continue;
+          al = filt_run(&v->flt[fk], al, 0);
+          ar = v->pcm_channels == 1 ? al : filt_run(&v->flt[fk], ar, 1);
         }
-        if (v->hladder_on) {
-          al = ladder_run(&v->hlad, al, v->hlad_cut, v->hlad_k, v->hlad_drive) * v->hlad_makeup;
-          ar = v->pcm_channels == 1 ? al : ladder_run(&v->hlad_r, ar, v->hlad_cut, v->hlad_k, v->hlad_drive) * v->hlad_makeup;
-        } else if (v->hpf.active) {
-          al = biquad_run(&v->hpf, al);
-          ar = v->pcm_channels == 1 ? al : biquad_run(&v->hpf_r, ar);
-          if (v->hp24) { al = biquad_run(&v->hpf2, al); ar = v->pcm_channels == 1 ? al : biquad_run(&v->hpf2_r, ar); }
+        if (v->vow.on) {
+          al = vowel_run(&v->vow, al, 0);
+          ar = v->pcm_channels == 1 ? al : vowel_run(&v->vow, ar, 1);
         }
         // coarse → crush → shape → distort → tremolo (superdough's order)
         if (v->pcm_channels == 1) {
@@ -2174,6 +2530,46 @@ __attribute__((export_name("sd_dsp"))) void sd_dsp(void) {
         voice_emit(v, i, al, ar);
         continue;
       }
+      // INSTANTANEOUS FREQUENCY = (param value + FM) · 2^(detune/1200). The
+      // oscillator clamps its computed frequency to ±Nyquist; the supersaw and
+      // pulse worklets floor their frequency param at EPSILON first.
+      double fi;
+      if (!v->fm_on) fi = v->phase_inc * (double)sr_f; // control-rate value (above)
+      else {
+      fi = v->base_freq;
+      {
+        double mp = v->fm_phase;
+        float m;
+        switch (v->fm_wave) {
+          case 1: m = (mp < 0.5 ? 1.0f : -1.0f) * WA_NORM; break;                     // square
+          case 2: m = (float)(2.0 * (mp + 0.5 - (double)(int)(mp + 0.5)) - 1.0) * WA_NORM; break; // saw (0, rising)
+          case 3: m = mp < 0.25 ? (float)(4.0 * mp) : mp < 0.75 ? (float)(2.0 - 4.0 * mp) : (float)(4.0 * mp - 4.0); break;
+          case 4: m = nz_rand(); break;
+          case 5: {
+            float w = nz_rand(); float *b = v->fm_nb;
+            b[0] = 0.99886f * b[0] + w * 0.0555179f; b[1] = 0.99332f * b[1] + w * 0.0750759f;
+            b[2] = 0.969f * b[2] + w * 0.153852f;    b[3] = 0.8665f * b[3] + w * 0.3104856f;
+            b[4] = 0.55f * b[4] + w * 0.5329522f;    b[5] = -0.7616f * b[5] - w * 0.016898f;
+            m = (b[0] + b[1] + b[2] + b[3] + b[4] + b[5] + b[6] + w * 0.5362f) * 0.11f;
+            b[6] = w * 0.115926f;
+            break;
+          }
+          case 6: { float w = nz_rand(); m = (v->fm_nlast + 0.02f * w) / 1.02f; v->fm_nlast = m; break; }
+          case 7: { float u = nz_rand() * 0.5f + 0.5f; m = u < 0.02f ? nz_rand() : 0.0f; break; } // density 2
+          default: m = sd_sinf(TWO_PI * (float)mp);
+        }
+        fi += (double)(v->fm_dev * m * v->fm_envval);
+        v->fm_phase += (double)v->fm_modfreq / (double)sr_f;
+        v->fm_phase -= (double)(long long)v->fm_phase;
+        if (v->fm_phase < 0) v->fm_phase += 1.0;
+      }
+      if (v->src == SRC_SUPERSAW || v->src == SRC_PULSE) { if (fi < 1e-9) fi = 1e-9; }
+      fi *= (double)v->pitch_mult;
+      const double nyq = 0.5 * (double)sr_f;
+      if (fi > nyq) fi = nyq;
+      if (fi < -nyq) fi = -nyq;
+      v->phase_inc = fi * inv_sr;
+      }
       double t = v->phase;
       double dt = v->phase_inc;
       float s;
@@ -2196,20 +2592,12 @@ __attribute__((export_name("sd_dsp"))) void sd_dsp(void) {
         float env = adsr_at(&v->env, tt, v->dur);
         float al = suml * v->amp * env;
         float ar = sumr * v->amp * env;
-        if (v->ladder_on) {
-          al = ladder_run(&v->lad, al, v->lad_cut, v->lad_k, v->lad_drive) * v->lad_makeup;
-          ar = ladder_run(&v->lad_r, ar, v->lad_cut, v->lad_k, v->lad_drive) * v->lad_makeup;
-        } else if (v->lpf.active) {
-          al = biquad_run(&v->lpf, al); ar = biquad_run(&v->lpf_r, ar);
-          if (v->lp24) { al = biquad_run(&v->lpf2, al); ar = biquad_run(&v->lpf2_r, ar); }
+        for (int fk = 0; fk < 3; fk++) {
+          if (!v->flt[fk].on) continue;
+          al = filt_run(&v->flt[fk], al, 0);
+          ar = filt_run(&v->flt[fk], ar, 1);
         }
-        if (v->hladder_on) {
-          al = ladder_run(&v->hlad, al, v->hlad_cut, v->hlad_k, v->hlad_drive) * v->hlad_makeup;
-          ar = ladder_run(&v->hlad_r, ar, v->hlad_cut, v->hlad_k, v->hlad_drive) * v->hlad_makeup;
-        } else if (v->hpf.active) {
-          al = biquad_run(&v->hpf, al); ar = biquad_run(&v->hpf_r, ar);
-          if (v->hp24) { al = biquad_run(&v->hpf2, al); ar = biquad_run(&v->hpf2_r, ar); }
-        }
+        if (v->vow.on) { al = vowel_run(&v->vow, al, 0); ar = vowel_run(&v->vow, ar, 1); }
         voice_pre_pan(v, &al, &ar); // coarse → crush → shape → distort → tremolo
         if (v->pan_set) {
           // StereoPanner STEREO law (spec): x>0 folds L into R, x<0 folds R into L
@@ -2258,22 +2646,79 @@ __attribute__((export_name("sd_dsp"))) void sd_dsp(void) {
           s = u < v->nz_density * 0.01f ? nz_rand() : 0.0f;
           break;
         }
+        case SRC_PULSE: {
+          // PulseOscillatorProcessor, sample for sample. The worklet only runs
+          // for render quanta that START after `begin` (currentTime <= begin →
+          // silent) and its `env` restarts at 1 every quantum.
+          if (!v->pl_live) {
+            if (engine_frame > v->start_frame) v->pl_live = true;
+            else { s = 0; break; }
+          }
+          if (i == 0) v->pl_env = 1.0;
+          double pwv = v->pl_pw;
+          if (v->pw_lfo) { // getLfo: (tri(φ,.5) − .5)·depth, clamped to ±depth/2
+            double ph = v->pw_phase;
+            double tri = ph >= 0.5 ? 2.0 - 2.0 * ph : 2.0 * ph;
+            pwv += (tri - 0.5) * (double)v->pw_depth;
+            v->pw_phase += (double)v->pw_rate / (double)sr_f;
+            if (v->pw_phase > 1.0) v->pw_phase -= 1.0;
+          }
+          if (pwv < 0) pwv = 0; // the pulsewidth param's min
+          double pwc = pwv > 0.99 ? 0.99 : pwv;
+          const double PI_D = 3.14159265358979323846;
+          double pwr = (1.0 - pwc) * PI_D;
+          double freq = fi; // frequency param (+FM, floored) through the detune
+          double dphi = freq * 2.0 * PI_D / (double)sr_f;
+          v->pl_dphif += 0.1 * (dphi - v->pl_dphif);
+          v->pl_env *= 0.9998;
+          v->pl_envf += 0.1 * (v->pl_env - v->pl_envf);
+          double B = 2.3 * (1.0 - 0.0001 * freq);
+          if (B < 0) B = 0;
+          v->pl_phi += v->pl_dphif;
+          if (v->pl_phi >= PI_D) v->pl_phi -= 2.0 * PI_D;
+          double out0 = sd_cos_d(v->pl_phi + B * v->pl_y0);
+          v->pl_y0 = 0.5 * (out0 + v->pl_y0);
+          double out1 = sd_cos_d(v->pl_phi + B * v->pl_y1 + pwr);
+          v->pl_y1 = 0.5 * (out1 + v->pl_y1);
+          s = (float)(0.15 * (out0 - out1) * v->pl_envf);
+          break;
+        }
         case SRC_SAW: {
           float pos = (float)(t * (double)WT_LEN);
           int i0 = (int)pos;
+          if (i0 >= WT_LEN) i0 = WT_LEN - 1;
           float fr = pos - (float)i0;
+          if (v->ptab) { s = v->ptab[i0] + (v->ptab[i0 + 1] - v->ptab[i0]) * fr; break; }
           const float *tab = wt_saw[v->wt_lvl];
-          s = tab[i0] + (tab[i0 + 1] - tab[i0]) * fr;
+          s = (tab[i0] + (tab[i0 + 1] - tab[i0]) * fr) * WA_NORM;
           break;
         }
         case SRC_SQUARE: {
+          if (v->ptab) {
+            float pos = (float)(t * (double)WT_LEN);
+            int i0 = (int)pos;
+            if (i0 >= WT_LEN) i0 = WT_LEN - 1;
+            float fr = pos - (float)i0;
+            s = v->ptab[i0] + (v->ptab[i0 + 1] - v->ptab[i0]) * fr;
+            break;
+          }
+          double adt = dt < 0 ? -dt : dt;
           s = t < 0.5 ? 1.0f : -1.0f;
-          s += polyblep(t, dt);
+          s += polyblep(t, adt);
           double t2 = t + 0.5; if (t2 >= 1.0) t2 -= 1.0;
-          s -= polyblep(t2, dt);
+          s -= polyblep(t2, adt);
+          s *= WA_NORM;
           break;
         }
         default: { // triangle — SPEC phase: starts 0 rising, peak +1 at t=0.25
+          if (v->ptab) {
+            float pos = (float)(t * (double)WT_LEN);
+            int i0 = (int)pos;
+            if (i0 >= WT_LEN) i0 = WT_LEN - 1;
+            float fr = pos - (float)i0;
+            s = v->ptab[i0] + (v->ptab[i0 + 1] - v->ptab[i0]) * fr;
+            break;
+          }
           // (the sin-series limit; the old −1-start was 90° late and shifted
           // steady-state sums with octave-related saw partials)
           float ph = (float)t;
@@ -2282,19 +2727,22 @@ __attribute__((export_name("sd_dsp"))) void sd_dsp(void) {
       }
       v->phase += dt;
       if (v->phase >= 1.0) v->phase -= 1.0;
+      if (v->phase < 0.0) v->phase += 1.0; // deep FM runs the carrier backwards
+      if (v->nmix_on) { // drywet(osc, pink, noise) — the oscillator's own mix, pre-envelope
+        float w = nz_rand(); float *b = v->nz_b;
+        b[0] = 0.99886f * b[0] + w * 0.0555179f; b[1] = 0.99332f * b[1] + w * 0.0750759f;
+        b[2] = 0.969f * b[2] + w * 0.153852f;    b[3] = 0.8665f * b[3] + w * 0.3104856f;
+        b[4] = 0.55f * b[4] + w * 0.5329522f;    b[5] = -0.7616f * b[5] - w * 0.016898f;
+        float pk = (b[0] + b[1] + b[2] + b[3] + b[4] + b[5] + b[6] + w * 0.5362f) * 0.11f;
+        b[6] = w * 0.115926f;
+        s = s * v->nmix_dry + pk * v->nmix_wet;
+      }
 
       float env = adsr_at(&v->env, tt, v->dur);
       float x = s * v->amp * env;
-      if (v->ladder_on) x = ladder_run(&v->lad, x, v->lad_cut, v->lad_k, v->lad_drive) * v->lad_makeup;
-      else if (v->lpf.active) {
-        x = biquad_run(&v->lpf, x);
-        if (v->lp24) x = biquad_run(&v->lpf2, x);
-      }
-      if (v->hladder_on) x = ladder_run(&v->hlad, x, v->hlad_cut, v->hlad_k, v->hlad_drive) * v->hlad_makeup;
-      else if (v->hpf.active) {
-        x = biquad_run(&v->hpf, x);
-        if (v->hp24) x = biquad_run(&v->hpf2, x);
-      }
+      for (int fk = 0; fk < 3; fk++)
+        if (v->flt[fk].on) x = filt_run(&v->flt[fk], x, 0);
+      if (v->vow.on) x = vowel_run(&v->vow, x, 0);
       voice_pre_pan_mono(v, &x); // coarse → crush → shape → distort → tremolo
       float al = x * v->pan_l, ar = x * v->pan_r;
       voice_post_pan(v, engine_frame + i, &al, &ar);
@@ -2405,8 +2853,32 @@ __attribute__((export_name("sd_dsp"))) void sd_dsp(void) {
       float g = orbit_duck_gain(o, engine_frame + i);
       o->out_g += (o->out_g_tgt - o->out_g) * 0.002f; // kill ramp (~10ms tau)
       g *= o->out_g;
-      float sl = (o->dry[i * OUT_CH] + dl + wl) * g;
-      float sr2 = (o->dry[i * OUT_CH + 1] + dr + wr) * g;
+      float sl = o->dry[i * OUT_CH] + dl + wl;
+      float sr2 = o->dry[i * OUT_CH + 1] + dr + wr;
+      if (o->djf_on) {
+        if (i == 0 && engine_frame >= o->djf_at) o->djf_val = o->djf_next; // k-rate value[0]
+        float dv = sd_clampf(o->djf_val, 0.0f, 1.0f);
+        int ft = dv > 0.51f ? 2 : dv < 0.49f ? 1 : 0; // hipass · lopass · none
+        if (ft) {
+          double vv = ft == 2 ? (dv - 0.5f) * 2.0f : dv * 2.0f;
+          double cut = vv * 11.0; cut = cut * cut * cut * cut; // (v·11)^4
+          double nyq1 = (double)sr_f / 2.0 - 1.0;
+          if (cut > nyq1) cut = nyq1;
+          double c = 2.0 * sd_sin_d(cut * 3.14159265358979323846 / (double)sr_f);
+          if (c < 0) c = 0; if (c > 1.14) c = 1.14;
+          const double r = 0.28717458874925877; // 0.5^(8·0.1 + 1), resonance 0.1
+          double mrc = 1.0 - r * c;
+          float in[2] = { sl, sr2 };
+          for (int ch = 0; ch < 2; ch++) { // TwoPoleFilter.update
+            o->djf_s0[ch] = mrc * o->djf_s0[ch] - c * o->djf_s1[ch] + c * (double)in[ch];
+            o->djf_s1[ch] = mrc * o->djf_s1[ch] + c * o->djf_s0[ch];
+            in[ch] = ft == 1 ? (float)o->djf_s1[ch] : in[ch] - (float)o->djf_s1[ch];
+          }
+          sl = in[0]; sr2 = in[1];
+        }
+      }
+      sl *= g;
+      sr2 *= g;
       out_buf[i * OUT_CH] += sl;
       out_buf[i * OUT_CH + 1] += sr2;
       if (stems_on) {

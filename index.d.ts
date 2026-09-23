@@ -1,9 +1,12 @@
 /** Superdough-style control names, plus anything numeric the engine knows. */
 export type ZaltzParams = {
-  /** Sound source: sine | sawtooth | square | triangle | supersaw | white |
-   *  pink | brown | crackle — or "sample" (with `sample` set to a loaded id). */
+  /** Sound source: sine | sawtooth | square | triangle | supersaw | pulse |
+   *  white | pink | brown | crackle — or "sample" (with `sample` set to a loaded id). */
   s?: string;
-  note?: number;
+  /** MIDI number, or a Strudel note name ("c4", "bf3", "f#2"). */
+  note?: number | string;
+  /** On saw/square/triangle: a harmonic count. On supersaw: the detune. */
+  n?: number;
   freq?: number;
   /** Uploaded sample id (see loadSample / loadAudioBuffer). */
   sample?: number;
@@ -19,6 +22,38 @@ export type ZaltzParams = {
   hpf?: number;
   hpq?: number;
   ftype?: "ladder" | "12db" | "24db";
+  /** Band-pass centre (Hz) and Q (linear). */
+  bandf?: number;
+  bandq?: number;
+  /** Filter envelopes: lp*, hp*, bp* attack/decay/sustain/release/env, shared anchor. */
+  lpenv?: number;
+  hpenv?: number;
+  bpenv?: number;
+  fanchor?: number;
+  vowel?: "a" | "e" | "i" | "o" | "u" | "ae" | "aa" | "oe" | "ue" | "y" | "uh" | "un" | "en" | "an" | "on" | string;
+  /** FM operator 1: index, harmonicity, modulator wave, its envelope. */
+  fmi?: number;
+  fmh?: number;
+  fmwave?: "sine" | "square" | "sawtooth" | "triangle" | "white" | "pink" | "brown" | "crackle";
+  fmenv?: "exp" | "lin";
+  /** Pulse width (s: "pulse") and its LFO. */
+  pw?: number;
+  pwrate?: number;
+  pwsweep?: number;
+  /** Pink-noise mix into an oscillator (0–1). */
+  noise?: number;
+  distort?: number;
+  distortvol?: number;
+  distorttype?: string | number;
+  tremolo?: number;
+  tremolodepth?: number;
+  tremoloshape?: "tri" | "sine" | "ramp" | "saw" | "square";
+  /** Orbit DJ filter: < .49 low-pass, > .51 high-pass. */
+  djf?: number;
+  vib?: number;
+  vibmod?: number;
+  penv?: number;
+  octave?: number;
   room?: number;
   roomsize?: number;
   delay?: number;
